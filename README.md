@@ -58,21 +58,21 @@ fine for occasional preview but too slow for live editing.
 - **[snacks.nvim](https://github.com/folke/snacks.nvim)** with `image.enabled = true` (the renderer + placement engine)
 - **Node.js 18+**
 - **A graphics-capable terminal**: Kitty, iTerm2, WezTerm, or Ghostty
-- **`mathjax-full`** (npm): `npm install -g mathjax-full`
+- **`@mathjax/src` 4.x** (npm): `npm install -g @mathjax/src@4`
 - **An SVG rasterizer**: `rsvg-convert` / librsvg (**strongly recommended** — handles MathJax SVG and `currentColor` correctly); ImageMagick is a fallback but may silently produce blank or corrupt output on complex equations
 
 ### Linux
 
 ```sh
 sudo apt install nodejs imagemagick librsvg2-bin
-sudo npm install -g mathjax-full
+sudo npm install -g @mathjax/src@4
 ```
 
 ### macOS
 
 ```sh
 brew install node imagemagick librsvg
-npm install -g mathjax-full
+npm install -g @mathjax/src@4
 ```
 
 Run `:checkhealth latex-preview` after install to verify.
@@ -414,7 +414,7 @@ Anything MathJax supports:
 - Custom macros from buffer or `.sty`
 - `\begin{equation}`, `\begin{align}`, `\begin{gather}`, `\begin{multline}`,
   `\begin{cases}`, `\begin{matrix}` and friends
-- `\boldsymbol`, `\mathbb`, `\mathcal`, `\mathfrak`, etc.
+- `\bm`, `\boldsymbol`, `\mathbb`, `\mathcal`, `\mathfrak`, etc.
 - `\color`, `\mathcolor`
 - `tikz-cd` (commutative diagrams)
 
@@ -497,9 +497,9 @@ vim.b.latex_preview_density = 300
 vim.b.latex_preview_display_density = 600
 ```
 
-**Daemon respawns repeatedly.** `mathjax-full` not in the search path.
+**Daemon respawns repeatedly.** `@mathjax/src@4` not in the search path.
 Set `LATEX_PREVIEW_MATHJAX_PATH` env var to its install directory, or
-`npm install -g mathjax-full` again.
+`npm install -g @mathjax/src@4` again.
 
 **It's slow on the very first equation.** That's the daemon boot
 (~300–500 ms on modern hardware). Every later equation is fast.

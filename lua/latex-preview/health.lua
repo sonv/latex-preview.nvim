@@ -3,7 +3,7 @@
 -- :checkhealth latex-preview
 --
 -- Verifies all the pieces a working setup needs:
---   * Node + mathjax-full
+--   * Node + @mathjax/src
 --   * a rasterizer (magick or rsvg-convert)
 --   * a graphics-capable terminal
 --   * the bundled daemon script is on the runtimepath
@@ -72,7 +72,7 @@ local function find_daemon_script()
   return nil
 end
 
--- The daemon script owns the canonical mathjax-full candidate list; we ask
+-- The daemon script owns the canonical @mathjax/src candidate list; we ask
 -- it to enumerate via `--list-paths` so the Lua side never drifts. Returns
 -- a string[] of candidate paths, or nil if we can't run the script.
 local function list_mathjax_candidates(script_path)
@@ -86,29 +86,59 @@ local function list_mathjax_candidates(script_path)
   return clean
 end
 
-local function check_mathjax_full(script_path)
+local function mathjax_package_info(path)
+  local package_path = path .. "/package.json"
+  if vim.fn.filereadable(package_path) ~= 1 then return nil end
+  local ok, decoded = pcall(vim.json.decode, table.concat(vim.fn.readfile(package_path), "\n"))
+  if ok and type(decoded) == "table" then return decoded end
+  return nil
+end
+
+local function is_mathjax4_source(info)
+  return type(info) == "table"
+    and info.name == "@mathjax/src"
+    and type(info.version) == "string"
+    and info.version:match("^4%.") ~= nil
+end
+
+local function describe_package(info)
+  if type(info) ~= "table" then return "unknown package" end
+  return tostring(info.name or "unknown") .. "@" .. tostring(info.version or "unknown")
+end
+
+local function check_mathjax_src(script_path)
   local candidates = list_mathjax_candidates(script_path)
   if not candidates then
-    report_warn("could not enumerate mathjax-full candidate paths",
+    report_warn("could not enumerate @mathjax/src candidate paths",
       { "Need both `node` and the bundled scripts/mathjax-daemon.mjs.",
-        "If you haven't yet, install with: npm install -g mathjax-full@3" })
+        "If you haven't yet, install with: npm install -g @mathjax/src@4" })
     return false
   end
+  local unsupported = {}
   for _, p in ipairs(candidates) do
-    if vim.fn.filereadable(p .. "/package.json") == 1 then
-      report_ok("mathjax-full found at " .. p)
+    local info = mathjax_package_info(p)
+    if is_mathjax4_source(info) then
+      report_ok("@mathjax/src " .. info.version .. " found at " .. p)
       return true
+    elseif info then
+      unsupported[#unsupported + 1] = p .. " (" .. describe_package(info) .. ")"
     end
   end
   local advice = {
-    "Install with: npm install -g mathjax-full@3",
+    "Install with: npm install -g @mathjax/src@4",
     "Or set the environment variable LATEX_PREVIEW_MATHJAX_PATH to its install dir.",
-    "Checked paths:",
   }
+  if #unsupported > 0 then
+    table.insert(advice, "Found unsupported packages:")
+    for _, p in ipairs(unsupported) do
+      table.insert(advice, "  " .. p)
+    end
+  end
+  table.insert(advice, "Checked paths:")
   for _, p in ipairs(candidates) do
     table.insert(advice, "  " .. p)
   end
-  report_err("mathjax-full not found", advice)
+  report_err("@mathjax/src@4 not found", advice)
   return false
 end
 
@@ -177,10 +207,10 @@ function M.check()
   check_snacks()
   check_executable("node",
     { "Install Node.js 18+ — https://nodejs.org/" })
-  -- check_mathjax_full needs the daemon script path (it shells out to it
+  -- check_mathjax_src needs the daemon script path (it shells out to it
   -- with --list-paths), so resolve once and pass to both checks.
   local script_path = find_daemon_script()
-  check_mathjax_full(script_path)
+  check_mathjax_src(script_path)
   check_daemon_script(script_path)
 
   vim.health.start("latex-preview: rendering")

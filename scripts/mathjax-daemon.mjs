@@ -23,7 +23,7 @@
 // One-shot mode (for ad-hoc use and tests):
 //   mathjax-daemon.mjs --in FILE --out FILE.svg [--display] [--color HEX]
 //
-// Requires:  npm i -g mathjax-full   (or local install — auto-detected)
+// Requires:  npm i -g @mathjax/src@4   (or local install — auto-detected)
 //
 
 import { argv, exit, stderr, stdin, stdout } from "node:process";
@@ -47,7 +47,7 @@ function parseArgs(a) {
 }
 
 // ---------------------------------------------------------------------------
-// Canonical mathjax-full candidate path list. The Lua side (health.lua)
+// Canonical @mathjax/src candidate path list. The Lua side (health.lua)
 // invokes this script with --list-paths to read this list rather than
 // duplicating it — keep the resolution logic in exactly one place.
 // ---------------------------------------------------------------------------
@@ -65,17 +65,17 @@ async function buildCandidatePaths({ includeNpm = true } = {}) {
 
   add(process.env.LATEX_PREVIEW_MATHJAX_PATH);
   add(process.env.SNACKS_MATHJAX_PATH);
-  add(path.join(here, "node_modules", "mathjax-full"));
-  add(path.join(here, "..", "node_modules", "mathjax-full"));
-  add(path.join(process.cwd(), "node_modules", "mathjax-full"));
+  add(path.join(here, "node_modules", "@mathjax", "src"));
+  add(path.join(here, "..", "node_modules", "@mathjax", "src"));
+  add(path.join(process.cwd(), "node_modules", "@mathjax", "src"));
   for (const p of [
-    "/usr/lib/node_modules/mathjax-full",
-    "/usr/local/lib/node_modules/mathjax-full",
-    "/opt/homebrew/lib/node_modules/mathjax-full",
-    "/opt/local/lib/node_modules/mathjax-full",
-    path.join(process.env.HOME || "", ".npm-global/lib/node_modules/mathjax-full"),
+    "/usr/lib/node_modules/@mathjax/src",
+    "/usr/local/lib/node_modules/@mathjax/src",
+    "/opt/homebrew/lib/node_modules/@mathjax/src",
+    "/opt/local/lib/node_modules/@mathjax/src",
+    path.join(process.env.HOME || "", ".npm-global/lib/node_modules/@mathjax/src"),
     path.join(process.env.HOME || "",
-      ".nvm/versions/node/" + process.version + "/lib/node_modules/mathjax-full"),
+      ".nvm/versions/node/" + process.version + "/lib/node_modules/@mathjax/src"),
   ]) add(p);
   if (includeNpm) {
     try {
@@ -83,7 +83,7 @@ async function buildCandidatePaths({ includeNpm = true } = {}) {
         encoding: "utf8",
         stdio: ["ignore", "pipe", "ignore"],
       }).trim();
-      add(path.join(npmRoot, "mathjax-full"));
+      add(path.join(npmRoot, "@mathjax", "src"));
     } catch (_) {
       // npm is optional; explicit env/local/hardcoded paths may still work.
     }
@@ -95,6 +95,98 @@ async function buildCandidatePaths({ includeNpm = true } = {}) {
 // MathJax bootstrap. Resolved once at startup and kept in module scope so
 // the daemon loop can reuse the loaded modules across thousands of requests.
 // ---------------------------------------------------------------------------
+const TEX_PACKAGES = [
+  "base",
+  "action",
+  "ams",
+  "amscd",
+  "bbm",
+  "bboldx",
+  "bbox",
+  "begingroup",
+  "boldsymbol",
+  "braket",
+  "bussproofs",
+  "cancel",
+  "cases",
+  "centernot",
+  "color",
+  "colortbl",
+  "configmacros",
+  "dsfont",
+  "empheq",
+  "enclose",
+  "extpfeil",
+  "gensymb",
+  "html",
+  "mathtools",
+  "mhchem",
+  "newcommand",
+  "setoptions",
+  "tagformat",
+  "texhtml",
+  "textcomp",
+  "textmacros",
+  "unicode",
+  "units",
+  "upgreek",
+  "verb",
+];
+
+const TEX_PACKAGE_EXCLUDES = new Set([
+  // Strict rendering needs actual errors rather than red merror output.
+  "noerrors",
+  "noundefined",
+  // These rely on MathJax's component loader. We import packages directly.
+  "autoload",
+  "require",
+  // Keep the LaTeX-compatible color package as the default.
+  "colorv2",
+  // This redefines common macros like \sin and \div, so don't enable it globally.
+  "physics",
+]);
+
+function readPackageInfo(fsSync, path, dir) {
+  try {
+    return JSON.parse(fsSync.readFileSync(path.join(dir, "package.json"), "utf8"));
+  } catch (_) {
+    return null;
+  }
+}
+
+function isMathJax4Source(info) {
+  return info && info.name === "@mathjax/src" && /^4\./.test(String(info.version || ""));
+}
+
+async function loadTexPackages(mjPath, u, fsSync, path) {
+  const packages = [];
+  const add = (name) => {
+    if (!name || TEX_PACKAGE_EXCLUDES.has(name) || packages.includes(name)) return;
+    packages.push(name);
+  };
+  for (const name of TEX_PACKAGES) add(name);
+
+  const texDir = path.join(mjPath, "mjs", "input", "tex");
+  try {
+    for (const entry of fsSync.readdirSync(texDir, { withFileTypes: true })) {
+      if (entry.isDirectory()) add(entry.name);
+    }
+  } catch (_) {
+    // The imports below will report a concrete failure if the package layout is invalid.
+  }
+
+  for (const name of packages) {
+    const dir = path.join(texDir, name);
+    const files = fsSync.existsSync(dir)
+      ? fsSync.readdirSync(dir).filter((file) => /Configuration\.js$/.test(file)).sort()
+      : [];
+    for (const file of files) {
+      await import(u(path.join("input", "tex", name, file)));
+    }
+  }
+  return packages;
+}
+
 async function bootMathJax() {
   const path = await import("node:path");
   const fsSync = await import("node:fs");
@@ -105,20 +197,22 @@ async function bootMathJax() {
   // checked — defer it until the obvious locations have all missed.
   const findIn = (cands) => {
     for (const c of cands) {
-      if (c && fsSync.existsSync(path.join(c, "package.json"))) return c;
+      if (!c || !fsSync.existsSync(path.join(c, "package.json"))) continue;
+      const info = readPackageInfo(fsSync, path, c);
+      if (isMathJax4Source(info)) return { path: c, info };
     }
     return null;
   };
   let candidates = await buildCandidatePaths({ includeNpm: false });
-  let mjPath = findIn(candidates);
-  if (!mjPath) {
+  let found = findIn(candidates);
+  if (!found) {
     candidates = await buildCandidatePaths({ includeNpm: true });
-    mjPath = findIn(candidates);
+    found = findIn(candidates);
   }
-  if (!mjPath) {
+  if (!found) {
     stderr.write(
-      "latex-preview/mathjax-daemon: mathjax-full not found. Install with:\n" +
-      "  npm install -g mathjax-full@3\n" +
+      "latex-preview/mathjax-daemon: @mathjax/src@4 not found. Install with:\n" +
+      "  npm install -g @mathjax/src@4\n" +
       "Or set LATEX_PREVIEW_MATHJAX_PATH to its install dir.\n" +
       "Checked:\n" +
       candidates.map((p) => "  " + p).join("\n") +
@@ -127,13 +221,15 @@ async function bootMathJax() {
     exit(1);
   }
 
-  const u = (sub) => pathToFileURL(path.join(mjPath, sub)).href;
-  const { mathjax }            = await import(u("js/mathjax.js"));
-  const { TeX }                = await import(u("js/input/tex.js"));
-  const { SVG }                = await import(u("js/output/svg.js"));
-  const { liteAdaptor }        = await import(u("js/adaptors/liteAdaptor.js"));
-  const { RegisterHTMLHandler } = await import(u("js/handlers/html.js"));
-  const { AllPackages }        = await import(u("js/input/tex/AllPackages.js"));
+  const mjPath = found.path;
+  const u = (sub) => pathToFileURL(path.join(mjPath, "mjs", sub)).href;
+  await import(u("util/asyncLoad/esm.js"));
+  const { mathjax }             = await import(u("mathjax.js"));
+  const { TeX }                 = await import(u("input/tex.js"));
+  const { SVG }                 = await import(u("output/svg.js"));
+  const { liteAdaptor }         = await import(u("adaptors/liteAdaptor.js"));
+  const { RegisterHTMLHandler } = await import(u("handlers/html.js"));
+  const packages = await loadTexPackages(mjPath, u, fsSync, path);
 
   // RegisterHTMLHandler installs a global handler against an adaptor. We
   // create a single "boot adaptor" here just to register; per-request work
@@ -141,7 +237,7 @@ async function bootMathJax() {
   const bootAdaptor = liteAdaptor();
   RegisterHTMLHandler(bootAdaptor);
 
-  return { mathjax, TeX, SVG, liteAdaptor, AllPackages };
+  return { mathjax, TeX, SVG, liteAdaptor, packages };
 }
 
 let MJ = null; // populated by bootMathJax()
@@ -208,22 +304,24 @@ function normalizeEquation(equation, display, displayMathStyle) {
 // Render one equation. Fresh adaptor per call, so a \newcommand the user
 // edits in their buffer correctly invalidates without daemon restart.
 // ---------------------------------------------------------------------------
-function renderOne({ preamble, equation, display, color, font_size, display_math_style, ex }) {
+async function renderOne({ preamble, equation, display, color, font_size, display_math_style, ex }) {
   if (!MJ) throw new Error("mathjax not booted");
-  const { mathjax, TeX, SVG, liteAdaptor, AllPackages } = MJ;
+  const { mathjax, TeX, SVG, liteAdaptor, packages } = MJ;
 
   const adaptor = liteAdaptor();
-  // Exclude `noerrors` and `noundefined` from the package list. AllPackages
-  // includes them by default; they convert TeX errors into rendered red
-  // text rather than throwing. That's the right behavior for a public web
-  // page (graceful degradation), but for us it makes engine="auto" unable
-  // to detect failure and fall back to pdflatex. We want strict errors.
-  const packages = AllPackages.filter(p => p !== "noerrors" && p !== "noundefined");
   const tex = new TeX({
     packages,
+    macros: {
+      // LaTeX's bm package defines \bm. MathJax has \boldsymbol, so provide
+      // the common alias explicitly for notes that use \usepackage{bm}.
+      bm: ["\\boldsymbol{#1}", 1],
+    },
     formatError: (jax, err) => { throw err; },
   });
-  const svg = new SVG({ fontCache: "local" });
+  const svg = new SVG({
+    fontCache: "local",
+    linebreaks: { inline: false },
+  });
   const html = mathjax.document("", { InputJax: tex, OutputJax: svg });
 
   const em = Number(font_size) > 0 ? Number(font_size) : 11;
@@ -238,10 +336,10 @@ function renderOne({ preamble, equation, display, color, font_size, display_math
   // parsing so a single bad line doesn't lose all the good ones.
   if (preamble && preamble.trim()) {
     try {
-      html.convert(preamble, opts);
+      await html.convertPromise(preamble, opts);
     } catch {
       for (const block of splitPreambleBlocks(preamble)) {
-        try { html.convert(block, opts); } catch { /* swallow */ }
+        try { await html.convertPromise(block, opts); } catch { /* swallow */ }
       }
     }
   }
@@ -251,7 +349,7 @@ function renderOne({ preamble, equation, display, color, font_size, display_math
   // to render inline or display style. Errors here are caller-visible —
   // the plugin surfaces ok=false as a notification; no automatic fallback.
   const math = normalizeEquation(equation, !!display, display_math_style);
-  const out = html.convert(math, { ...opts, display: !!display });
+  const out = await html.convertPromise(math, { ...opts, display: !!display });
   let svgStr = adaptor.innerHTML(out);
   const m = svgStr.match(/<svg[\s\S]*<\/svg>/);
   if (m) svgStr = m[0];
@@ -299,7 +397,7 @@ async function runDaemon() {
     }
     if (req.quit) { exit(0); }
     try {
-      const svg = renderOne(req);
+      const svg = await renderOne(req);
       stdout.write(JSON.stringify({ id: req.id, ok: true, svg }) + "\n");
     } catch (e) {
       stdout.write(JSON.stringify({
@@ -332,7 +430,7 @@ async function runOneShot(opts) {
   const m = noMeta.split(SPLIT);
   const preamble = (m[0] || "").trim();
   const equation = (m[1] || m[0] || "").trim();
-  const svg = renderOne({
+  const svg = await renderOne({
     preamble, equation,
     display: opts.display, color: opts.color, ex: opts.ex,
   });

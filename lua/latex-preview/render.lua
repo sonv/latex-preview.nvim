@@ -223,7 +223,7 @@ end
 ---@param req { preamble: string, equation: string, display: boolean, pad_to_cells: boolean? }
 ---@return string  cache key suitable for use as a filename stem
 local function cache_key(req)
-  local renderer_version = "raster-v8"
+  local renderer_version = "raster-v9-mathjax4"
   local fg = config.get_fg()
   local font_size = effective_font_size(req)
   local density = effective_density(req)

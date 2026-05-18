@@ -34,7 +34,7 @@ a one-time daemon boot (~1.5 s), each render takes 10-50 ms. Custom
   - Neovim 0.10+
   - snacks.nvim with image.enabled = true (renderer + placement engine)
   - Node.js 18+
-  - mathjax-full: `npm install -g mathjax-full@3`
+  - @mathjax/src 4.x: `npm install -g @mathjax/src@4`
   - A graphics-capable terminal: kitty, wezterm, or ghostty
   - ImageMagick + librsvg2 (or rsvg-convert alone)
 
@@ -411,8 +411,8 @@ Popup is too big or small ~
         Adjust render.density.
 
 Daemon respawns repeatedly ~
-        mathjax-full not found. `:checkhealth` will tell you where it
+        @mathjax/src@4 not found. `:checkhealth` will tell you where it
         looked. Set $LATEX_PREVIEW_MATHJAX_PATH or `npm install -g
-        mathjax-full@3`.
+        @mathjax/src@4`.
 
 vim:tw=78:ts=8:noet:ft=help:norl:

@@ -7,7 +7,7 @@
 -- equation-render requests over its stdin/stdout pipes via newline-
 -- delimited JSON.
 --
--- This exists because spawning Node + loading mathjax-full per equation
+-- This exists because spawning Node + loading MathJax per equation
 -- costs ~1.5 s per call. With a persistent daemon, per-equation latency
 -- drops to ~10-50 ms, which is what live preview needs.
 --
@@ -212,7 +212,7 @@ local function spawn()
     end
   end)
 
-  -- Ready timeout — fail loudly if mathjax-full isn't installed.
+  -- Ready timeout — fail loudly if @mathjax/src isn't installed.
   local timer = assert(uv.new_timer())
   timer:start(config.options.daemon.ready_timeout_ms, 0, function()
     timer:stop(); timer:close()
@@ -221,7 +221,7 @@ local function spawn()
         if state.ready then return end
         local hint = state.stderr_buf ~= ""
           and ("\n" .. state.stderr_buf:sub(1, 400))
-          or "\n(install with `npm install -g mathjax-full@3`)"
+          or "\n(install with `npm install -g @mathjax/src@4`)"
         vim.notify(
           "[latex-preview] daemon failed to become ready within "
             .. config.options.daemon.ready_timeout_ms .. " ms" .. hint,
