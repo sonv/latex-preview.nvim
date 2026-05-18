@@ -8,11 +8,22 @@ Rolling changes are listed newest first by date.
 
 ### Changed
 
+- Switched the MathJax dependency from `mathjax-full@3` to `@mathjax/src@4`; the daemon now loads MathJax 4 ES modules, uses promise-based conversion, and checks for a v4 `@mathjax/src` package in `:checkhealth`.
+- Render cache keys now include the MathJax 4 renderer version so images rendered with MathJax 3 are not reused after upgrade.
 - Added live per-buffer density controls with `:LatexPreview density [N|reset]` and `:LatexPreview display-density [N|reset]`, backed by buffer-local `b:latex_preview_density` and `b:latex_preview_display_density`.
 - Preamble extraction is now root-aware for multi-file projects: chapter buffers can use a root declared with `% !TEX root = ...`, vimtex's root metadata, or an unambiguous parent `.tex` file that reaches the chapter through `\input`, `\include`, or `\subfile`.
 - Reused live hover render files for unchanged equations instead of rerendering every time, reducing repeated SVG/PNG writes while navigating back to the same math.
 - Bounded reusable live-render temp files with the existing `snacks.max_cache_files`, `snacks.max_cache_bytes`, and `snacks.cache_grace_ms` settings, trimming whole render groups (`.svg`, `.png`, and matching `.info`) oldest-first.
 - Stopped routing Snacks image metadata into latex-preview's render cache; Snacks `.info` files now stay in Snacks' own cache, and stale `.info` files are removed by `:LatexPreview clear`.
+
+### Fixed
+
+- Added support for LaTeX's common `\bm{...}` command by mapping it to MathJax's `\boldsymbol{...}` support.
+- Disabled MathJax 4 inline SVG line breaking in the daemon so each preview still rasterizes from a single SVG.
+
+### Documentation
+
+- Documented the MathJax 4 install command and the `mathjax-full@3` to `@mathjax/src@4` upgrade path.
 
 ## 2026-05-01
 

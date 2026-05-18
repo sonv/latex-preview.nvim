@@ -77,6 +77,18 @@ npm install -g @mathjax/src@4
 
 Run `:checkhealth latex-preview` after install to verify.
 
+### Upgrading from MathJax 3
+
+Older versions used `mathjax-full@3`. This plugin now requires MathJax 4's
+`@mathjax/src` package instead:
+
+```sh
+npm install -g @mathjax/src@4
+```
+
+The old `mathjax-full` package can stay installed, but it is no longer used
+by the daemon or `:checkhealth latex-preview`.
+
 ## Install
 
 ### lazy.nvim
