@@ -350,7 +350,15 @@ async function renderOne({ preamble, equation, display, color, font_size, displa
   // the plugin surfaces ok=false as a notification; no automatic fallback.
   const math = normalizeEquation(equation, !!display, display_math_style);
   const out = await html.convertPromise(math, { ...opts, display: !!display });
-  let svgStr = adaptor.innerHTML(out);
+  // Use MathJax's XML serializer when available: MathJax 4 stamps every node
+  // with a `data-latex` attribute holding its raw TeX, so `a < b` yields
+  // data-latex="<". The HTML serializer (innerHTML) leaves </>/& unescaped in
+  // attribute values — valid HTML but invalid XML — and librsvg's strict XML
+  // parser (used by rsvg-convert downstream) rejects the file. serializeXML
+  // escapes them (data-latex="&lt;") and declares xmlns:xlink.
+  let svgStr = typeof adaptor.serializeXML === "function"
+    ? adaptor.serializeXML(out)
+    : adaptor.innerHTML(out);
   const m = svgStr.match(/<svg[\s\S]*<\/svg>/);
   if (m) svgStr = m[0];
   const viewBox = svgStr.match(/viewBox="([^"]+)"/);
