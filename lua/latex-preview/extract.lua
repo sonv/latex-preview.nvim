@@ -153,6 +153,9 @@ local function braced_args_after_command(line, cmd)
   while true do
     local s, e = line:find("\\" .. cmd .. "%f[%A]", i)
     if not s then break end
+    -- Always advance, including while the user is typing an unfinished
+    -- argument such as `\\usepackage{`. Otherwise this loop never returns.
+    i = e + 1
     local p = e + 1
     while line:sub(p, p):match("%s") do p = p + 1 end
     if line:sub(p, p) == "[" then
@@ -290,11 +293,19 @@ local function tex_arg_candidates(base_dirs, name)
   return out
 end
 
-local function file_reaches_child(path, child_path, root_dir, seen)
+local function watch_path(watched, path)
+  if not watched.seen[path] then
+    watched.seen[path] = true
+    watched.paths[#watched.paths + 1] = path
+  end
+end
+
+local function file_reaches_child(path, child_path, root_dir, seen, watched)
   path = normalize_path(path)
   if not path or seen[path] then return false end
   seen[path] = true
-  local lines = read_lines(path)
+  watch_path(watched, path)
+  local lines = lines_for_path(path)
   if not lines then return false end
   child_path = normalize_path(child_path)
   local file_dir = vim.fs.dirname(path)
@@ -304,7 +315,8 @@ local function file_reaches_child(path, child_path, root_dir, seen)
     for _, name in ipairs(input_names_from_line(line)) do
       for _, cand in ipairs(tex_arg_candidates(base_dirs, name)) do
         if cand == child_path then return true end
-        if cand:match("%.tex$") and uv.fs_stat(cand) and file_reaches_child(cand, child_path, root_dir, seen) then
+        watch_path(watched, cand)
+        if cand:match("%.tex$") and uv.fs_stat(cand) and file_reaches_child(cand, child_path, root_dir, seen, watched) then
           return true
         end
       end
@@ -313,18 +325,20 @@ local function file_reaches_child(path, child_path, root_dir, seen)
   return false
 end
 
-local function root_reaches_child(root_path, child_path)
+local function root_reaches_child(root_path, child_path, watched)
   local root_dir = vim.fs.dirname(root_path)
-  return file_reaches_child(root_path, child_path, root_dir, {})
+  return file_reaches_child(root_path, child_path, root_dir, {}, watched)
 end
 
-local function tex_root_from_parent_search(path)
+local function tex_root_from_parent_search(path, watched)
   path = normalize_path(path)
   if not path then return nil end
   local dir = vim.fs.dirname(path)
   local matches = {}
   local depth = 0
   while dir and dir ~= "" and dir ~= "/" and depth < 6 do
+    -- Directory signatures notice newly added/removed possible root files.
+    watch_path(watched, dir)
     local handle = uv.fs_scandir(dir)
     if handle then
       while true do
@@ -333,9 +347,10 @@ local function tex_root_from_parent_search(path)
         if typ == "file" and name:match("%.tex$") then
           local cand = normalize_path(dir .. "/" .. name)
           if cand ~= path then
-            local lines = read_lines(cand)
+            watch_path(watched, cand)
+            local lines = lines_for_path(cand)
             if lines and table.concat(lines, "\n"):find("\\begin{document}", 1, true)
-                and root_reaches_child(cand, path) then
+                and root_reaches_child(cand, path, watched) then
               matches[#matches + 1] = cand
             end
           end
@@ -350,14 +365,11 @@ local function tex_root_from_parent_search(path)
   end
 end
 
-local function resolve_tex_root(buf, lines)
+local function explicit_tex_root(buf, lines)
   local self_path = normalize_path(vim.api.nvim_buf_get_name(buf))
   if not self_path then return nil end
   local self_dir = vim.fs.dirname(self_path)
-  return tex_root_from_magic(lines, self_dir)
-    or tex_root_from_vimtex(buf)
-    or tex_root_from_parent_search(self_path)
-    or self_path
+  return tex_root_from_magic(lines, self_dir) or tex_root_from_vimtex(buf)
 end
 
 local function scan_referenced_files(start_path, source_lines)
@@ -384,7 +396,7 @@ local function scan_referenced_files(start_path, source_lines)
       if path and not seen_file[path] then
         seen_file[path] = true
         found[#found + 1] = path
-        local lines = read_lines(path)
+        local lines = lines_for_path(path)
         if lines then
           file_lines[path] = lines
           for _, line in ipairs(lines) do
@@ -400,7 +412,7 @@ local function scan_referenced_files(start_path, source_lines)
 
   local parts = {}
   for _, sty in ipairs(found) do
-    local lines = file_lines[sty] or read_lines(sty)
+    local lines = file_lines[sty] or lines_for_path(sty)
     if lines then
       local defs = M.extract_definitions(lines)
       if defs ~= "" then
@@ -491,10 +503,10 @@ local function file_signature(path)
   }, ":")
 end
 
-local function dependency_signature(paths)
+local function dependency_signature(paths, signature)
   local parts = {}
   for _, path in ipairs(paths or {}) do
-    parts[#parts + 1] = file_signature(path)
+    parts[#parts + 1] = (signature or file_signature)(path)
   end
   return table.concat(parts, "\n")
 end
@@ -533,34 +545,67 @@ function M.get_preamble(buf)
   ensure_cache_cleanup()
   local current_lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
   local current_path = normalize_path(vim.api.nvim_buf_get_name(buf))
-  local root_path = resolve_tex_root(buf, current_lines)
-  local root_lines = current_lines
-  if root_path and root_path ~= current_path then
-    root_lines = lines_for_path(root_path) or current_lines
+  local root_hint = explicit_tex_root(buf, current_lines)
+  local entry = cache[buf]
+  -- The root can also appear in the resolution graph and dependency list.
+  -- Inspect each source only once during this lookup.
+  local signatures = {}
+  local function signature(path)
+    if not signatures[path] then signatures[path] = file_signature(path) end
+    return signatures[path]
+  end
+  local watched = { paths = {}, seen = {} }
+  local root_path = root_hint
+  if not root_path then
+    if entry and entry.current_path == current_path and entry.root_hint == root_hint
+        and entry.resolution_sig == dependency_signature(entry.resolution_paths, signature) then
+      root_path = entry.root_path
+      watched.paths = entry.resolution_paths
+    else
+      root_path = tex_root_from_parent_search(current_path, watched) or current_path
+    end
   end
 
   local tick = vim.api.nvim_buf_get_changedtick(buf)
-  local root_sig = root_path and file_signature(root_path) or ""
-  local entry = cache[buf]
-  if entry
-      and entry.tick == tick
+  local root_sig = root_path and signature(root_path) or ""
+  local opts = config.options.extract
+  local options_sig = table.concat({ tostring(opts.scan_sty), tostring(opts.sty_search_depth),
+    tostring(opts.rewrite_providecommand), tostring(opts.rewrite_edef) }, ":")
+  local sources_unchanged = entry
+      and entry.current_path == current_path
+      and entry.options_sig == options_sig
       and entry.root_path == root_path
       and entry.root_sig == root_sig
-      and entry.dep_sig == dependency_signature(entry.deps) then
+      and entry.dep_sig == dependency_signature(entry.deps, signature)
+  if sources_unchanged and entry.tick == tick then
+    entry.root_hint = root_hint
+    entry.resolution_paths = watched.paths
+    entry.resolution_sig = dependency_signature(watched.paths, signature)
     return entry.value
   end
 
-  local root_defs = M.extract_definitions(root_lines)
+  local root_defs, sty_defs, deps
+  if sources_unchanged and root_path and root_path ~= current_path
+      and root_sig:sub(1, 8) ~= "missing:" then
+    -- Editing a chapter changes its own definitions, but does not require
+    -- rereading and rescanning an unchanged root preamble or its packages.
+    root_defs, sty_defs, deps = entry.root_defs, entry.sty_defs, entry.deps
+  else
+    local root_lines = current_lines
+    if root_path and root_path ~= current_path then
+      root_lines = lines_for_path(root_path) or current_lines
+    end
+    root_defs = M.extract_definitions(root_lines)
+    sty_defs, deps = "", {}
+    if config.options.extract.scan_sty then
+      sty_defs, deps = scan_referenced_files(root_path or current_path, root_lines)
+    end
+  end
+
   local buf_defs = ""
   if not root_path or root_path ~= current_path then
     buf_defs = M.extract_definitions(current_lines)
   end
-  local sty_defs = ""
-  local deps = {}
-  if config.options.extract.scan_sty then
-    sty_defs, deps = scan_referenced_files(root_path or current_path, root_lines)
-  end
-
   local parts = {}
   if sty_defs ~= "" then parts[#parts + 1] = sty_defs end
   if root_defs ~= "" then parts[#parts + 1] = root_defs end
@@ -569,10 +614,17 @@ function M.get_preamble(buf)
 
   cache[buf] = {
     tick = tick,
+    current_path = current_path,
+    root_hint = root_hint,
+    resolution_paths = watched.paths,
+    resolution_sig = dependency_signature(watched.paths, signature),
+    options_sig = options_sig,
     root_path = root_path,
     root_sig = root_sig,
+    root_defs = root_defs,
+    sty_defs = sty_defs,
     deps = deps,
-    dep_sig = dependency_signature(deps),
+    dep_sig = dependency_signature(deps, signature),
     value = combined,
   }
   return combined

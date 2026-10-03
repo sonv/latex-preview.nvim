@@ -39,6 +39,7 @@ local TS_QUERIES = {
     (latex_block) @any
   ]],
 }
+local ts_queries = {}
 
 local function strip_math_delimiters(text)
   local stripped = vim.trim(text)
@@ -63,18 +64,25 @@ end
 ---@return LatexPreview.Equation[]?
 local function ts_extract(buf, lang)
   local ok, parsers = pcall(require, "nvim-treesitter.parsers")
-  if not ok or not util.has_ts_parser(parsers, lang) then return nil end
+  if not util.has_ts_parser(ok and parsers or {}, lang) then return nil end
 
-  local parser = vim.treesitter.get_parser(buf, lang)
-  if not parser then return nil end
-  local tree = parser:parse()[1]
+  local ok_parser, parser = pcall(vim.treesitter.get_parser, buf, lang)
+  if not ok_parser or not parser then return nil end
+  local ok_parse, trees = pcall(parser.parse, parser)
+  if not ok_parse then return nil end
+  local tree = trees and trees[1]
   if not tree then return nil end
 
   local query_str = TS_QUERIES[lang]
   if not query_str then return nil end
 
-  local ok_query, query = pcall(vim.treesitter.query.parse, lang, query_str)
-  if not ok_query then return nil end
+  local query = ts_queries[lang]
+  if not query then
+    local ok_query
+    ok_query, query = pcall(vim.treesitter.query.parse, lang, query_str)
+    if not ok_query then return nil end
+    ts_queries[lang] = query
+  end
   local results = {}
   for id, node in query:iter_captures(tree:root(), buf) do
     local cap = query.captures[id]
@@ -124,7 +132,6 @@ local function regex_extract(buf)
     pos = nl + 1
   end
   local function byte_to_rc(byte)
-    -- binary search would be faster but row_starts is at most a few thousand
     local lo, hi = 1, #row_starts
     while lo < hi do
       local mid = math.floor((lo + hi + 1) / 2)
@@ -163,25 +170,29 @@ local function regex_extract(buf)
   --   "env"          keep the full environment wrapper for MathJax
   local patterns = {
     -- $$...$$ display, line-spanning. The capture is the body.
-    { pat = "%$%$(.-)%$%$",          display = true,  kind = "delim_match" },
+    { prefix = "$$", pat = "%$%$(.-)%$%$",          display = true,  kind = "delim_match" },
     -- \[...\] display
-    { pat = "\\%[(.-)\\%]",          display = true,  kind = "delim_match" },
+    { prefix = "\\[", pat = "\\%[(.-)\\%]",          display = true,  kind = "delim_match" },
     -- \(...\) inline
-    { pat = "\\%((.-)\\%)",          display = false, kind = "delim_match" },
+    { prefix = "\\(", pat = "\\%((.-)\\%)",          display = false, kind = "delim_match" },
     -- Math environments with optional star. Keep the wrapper so MathJax can
     -- interpret environment-specific alignment syntax.
-    { pat = "\\begin{equation%*?}(.-)\\end{equation%*?}", display = true, kind = "env" },
-    { pat = "\\begin{align%*?}(.-)\\end{align%*?}",       display = true, kind = "env" },
-    { pat = "\\begin{alignat%*?}%s*%b{}(.-)\\end{alignat%*?}", display = true, kind = "env" },
-    { pat = "\\begin{flalign%*?}(.-)\\end{flalign%*?}",   display = true, kind = "env" },
-    { pat = "\\begin{gather%*?}(.-)\\end{gather%*?}",     display = true, kind = "env" },
-    { pat = "\\begin{multline%*?}(.-)\\end{multline%*?}", display = true, kind = "env" },
-    { pat = "\\begin{eqnarray%*?}(.-)\\end{eqnarray%*?}", display = true, kind = "env" },
+    { prefix = "\\begin{equation", pat = "\\begin{equation%*?}(.-)\\end{equation%*?}", display = true, kind = "env" },
+    { prefix = "\\begin{align", pat = "\\begin{align%*?}(.-)\\end{align%*?}",       display = true, kind = "env" },
+    { prefix = "\\begin{alignat", pat = "\\begin{alignat%*?}%s*%b{}(.-)\\end{alignat%*?}", display = true, kind = "env" },
+    { prefix = "\\begin{flalign", pat = "\\begin{flalign%*?}(.-)\\end{flalign%*?}",   display = true, kind = "env" },
+    { prefix = "\\begin{gather", pat = "\\begin{gather%*?}(.-)\\end{gather%*?}",     display = true, kind = "env" },
+    { prefix = "\\begin{multline", pat = "\\begin{multline%*?}(.-)\\end{multline%*?}", display = true, kind = "env" },
+    { prefix = "\\begin{eqnarray", pat = "\\begin{eqnarray%*?}(.-)\\end{eqnarray%*?}", display = true, kind = "env" },
   }
 
   for _, p in ipairs(patterns) do
     local pos2 = 1
     while pos2 <= #source do
+      -- Most documents use only a few delimiter types. A literal search
+      -- avoids a full Lua-pattern scan for every absent environment.
+      pos2 = source:find(p.prefix, pos2, true)
+      if not pos2 then break end
       local s, e, body = source:find(p.pat, pos2)
       if not s then break end
       if not_consumed(s, e) then
@@ -209,20 +220,21 @@ local function regex_extract(buf)
 
   -- Inline $...$. Done last because $$..$$ and \begin{...} contain $ chars
   -- that would otherwise be treated as inline math. We also need to skip
-  -- escaped dollars (\$). Strategy: walk byte-by-byte, find an unescaped
+  -- escaped dollars (\$). Search directly for dollar delimiters rather than
+  -- allocating a one-byte substring for every byte of prose. Find an unescaped
   -- $, look for a matching unescaped $ on the same line, and confirm the
   -- range doesn't overlap with anything already consumed.
-  local function unescaped_at(idx)
-    return source:sub(idx, idx) == "$" and not util.is_escaped(source, idx)
-  end
-
   local i = 1
   while i <= #source do
-    if unescaped_at(i) and not_consumed(i, i) then
+    i = source:find("$", i, true)
+    if not i then break end
+    if not util.is_escaped(source, i) and not_consumed(i, i) then
       -- Find closing $ on the same line
       local j = i + 1
       local closed = nil
       while j <= #source do
+        j = source:find("[$\n]", j)
+        if not j then break end
         local c = source:sub(j, j)
         if c == "\n" then break end
         if c == "$" and not util.is_escaped(source, j) then
@@ -243,7 +255,9 @@ local function regex_extract(buf)
             text = body,
             display = false,
           }
-          mark(i, closed)
+          -- Inline matches are visited in order and skipped in full below;
+          -- inserting them into the display intervals only adds quadratic
+          -- table shifting for documents with interleaved inline/display math.
         end
         i = closed + 1
       else

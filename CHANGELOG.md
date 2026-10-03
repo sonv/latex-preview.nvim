@@ -8,6 +8,10 @@ Rolling changes are listed newest first by date.
 
 ### Changed
 
+- Reuse MathJax font data and compile preambles without producing discarded SVGs. Local warm PNG benchmarks fell from 47–49 ms to 19–20 ms with librsvg at 300 DPI.
+- Apply terminal-cell padding during librsvg rasterization, avoiding a separate ImageMagick process.
+- Reuse temporary PNGs and coalesce identical requests for all render callers. Snapshot render settings and include rasterizer and terminal-cell dimensions in cache keys.
+- Reduce fallback equation-scanning work and avoid rereading project files on unchanged preamble cache hits.
 - Switched the MathJax dependency from `mathjax-full@3` to `@mathjax/src@4`; the daemon now loads MathJax 4 ES modules, uses promise-based conversion, and checks for a v4 `@mathjax/src` package in `:checkhealth`.
 - Render cache keys now include the MathJax 4 renderer version so images rendered with MathJax 3 are not reused after upgrade.
 - Added live per-buffer density controls with `:LatexPreview density [N|reset]` and `:LatexPreview display-density [N|reset]`, backed by buffer-local `b:latex_preview_density` and `b:latex_preview_display_density`.
@@ -18,11 +22,20 @@ Rolling changes are listed newest first by date.
 
 ### Fixed
 
+- Keep MathJax's built-in double-struck `\mathbb` by excluding the incompatible `bboldx` extension from global loading.
+- Prevent incomplete package/input arguments from hanging preamble extraction. Use unsaved local macro-file contents and invalidate cached root discovery when its dependencies change.
+- Cancel pending previews and delayed updates on close, buffer leave, or automatic-hover disable. Ignore callbacks from stopped daemon processes after a replacement starts.
+- Invalidate open previews when rasterizer or terminal-cell dimensions change, and honor display-math padding inside theorem previews.
+- Publish PNGs atomically so failed conversions cannot leave a partial image that is reused as a cache hit.
+- Preserve multiline macro definitions and TeX comments when recovering from unsupported preamble commands. Restart fallback parsing from a clean macro state.
+- Handle malformed daemon requests without exiting, and evaluate standalone one-shot equations only once.
+- Recognize adjacent and nested reference/citation commands without treating the character after a command as part of its hover target.
 - Added support for LaTeX's common `\bm{...}` command by mapping it to MathJax's `\boldsymbol{...}` support.
 - Disabled MathJax 4 inline SVG line breaking in the daemon so each preview still rasterizes from a single SVG.
 
 ### Documentation
 
+- Reorganized the README around installation and daily use, corrected repository URLs and cache behavior, and added the new intro trailer.
 - Documented the MathJax 4 install command and the `mathjax-full@3` to `@mathjax/src@4` upgrade path.
 
 ## 2026-05-01

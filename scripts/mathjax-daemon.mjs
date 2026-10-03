@@ -4,9 +4,8 @@
 //
 // A long-running MathJax daemon for the latex-preview.nvim plugin. Reads
 // newline-delimited JSON requests from stdin and writes newline-delimited
-// JSON responses to stdout. Loads MathJax once at startup (~1.3s) so
-// per-request cost drops to ~10-50ms — enough for inline live preview
-// as the user types.
+// JSON responses to stdout. Loads MathJax and its font data once at startup
+// so subsequent requests only pay for parsing and typesetting their math.
 //
 // Protocol (one JSON object per line, both directions):
 //
@@ -15,7 +14,7 @@
 //   response:  {"id": <echoed>, "ok": true,  "svg": "<svg>...</svg>"}
 //          or  {"id": <echoed>, "ok": false, "err": "..."}
 //
-// Errors during preamble parsing are swallowed line-by-line (Overleaf
+// Errors during preamble parsing are swallowed block-by-block (Overleaf
 // pattern) so that \RequirePackage / \DeclareOption / \makeatletter inside
 // a .sty file don't kill the render. Errors on the actual equation
 // propagate so the plugin can surface them.
@@ -101,7 +100,6 @@ const TEX_PACKAGES = [
   "ams",
   "amscd",
   "bbm",
-  "bboldx",
   "bbox",
   "begingroup",
   "boldsymbol",
@@ -144,6 +142,10 @@ const TEX_PACKAGE_EXCLUDES = new Set([
   "colorv2",
   // This redefines common macros like \sin and \div, so don't enable it globally.
   "physics",
+  // bboldx replaces \mathbb with a variant missing from MathJax 4's default
+  // font, silently rendering upright letters. Keep the built-in double-struck
+  // glyphs, including when discovering packages from the installed TeX tree.
+  "bboldx",
 ]);
 
 function readPackageInfo(fsSync, path, dir) {
@@ -229,15 +231,17 @@ async function bootMathJax() {
   const { SVG }                 = await import(u("output/svg.js"));
   const { liteAdaptor }         = await import(u("adaptors/liteAdaptor.js"));
   const { RegisterHTMLHandler } = await import(u("handlers/html.js"));
+  const { STATE }               = await import(u("core/MathItem.js"));
   const packages = await loadTexPackages(mjPath, u, fsSync, path);
 
-  // RegisterHTMLHandler installs a global handler against an adaptor. We
-  // create a single "boot adaptor" here just to register; per-request work
-  // creates fresh adaptors so macros from request N don't leak into N+1.
-  const bootAdaptor = liteAdaptor();
-  RegisterHTMLHandler(bootAdaptor);
+  const adaptor = liteAdaptor();
+  RegisterHTMLHandler(adaptor);
+  // Font metrics and dynamically loaded glyphs are independent of TeX macro
+  // state. Construct them once; rebuilding the font for every keystroke is
+  // substantially more expensive than the actual typesetting of short math.
+  const fontData = new SVG().font;
 
-  return { mathjax, TeX, SVG, liteAdaptor, packages };
+  return { mathjax, TeX, SVG, adaptor, fontData, packages, STATE };
 }
 
 let MJ = null; // populated by bootMathJax()
@@ -253,6 +257,8 @@ function splitPreambleBlocks(preamble) {
       const c = line[i];
       if (c === "\\") {
         i++;
+      } else if (c === "%") {
+        return line.slice(0, i);
       } else if (c === "{") {
         depth++;
         started = true;
@@ -260,6 +266,7 @@ function splitPreambleBlocks(preamble) {
         depth--;
       }
     }
+    return line;
   };
 
   const flush = () => {
@@ -273,13 +280,17 @@ function splitPreambleBlocks(preamble) {
   for (const raw of preamble.split(/\r?\n/)) {
     const line = raw.trim();
     if (!line || line.startsWith("%")) {
-      if (block.length) flush();
+      // A comment or empty line inside a macro body cannot end the definition.
+      if (block.length) block.push("");
       continue;
     }
-    block.push(raw);
-    update(line.replace(/(?<!\\)%.*/, ""));
+    // MathJax's argument scanner counts braces inside comments. Remove the
+    // comment before replaying a block, while respecting escaped percent signs.
+    block.push(update(raw));
     if (started && depth <= 0) flush();
-    else if (!started && /^\\(?:let|newcounter)\b/.test(line)) flush();
+    // Unsupported control lines such as \makeatletter must not consume the
+    // following valid definition when the full-preamble parse has failed.
+    else if (!started && !/^\\(?:newcommand|renewcommand|providecommand|DeclareMathOperator|def|gdef|edef|newenvironment|renewenvironment)\b/.test(line)) flush();
   }
   if (block.length) flush();
   return blocks;
@@ -297,32 +308,37 @@ function normalizeEquation(equation, display, displayMathStyle) {
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter((line) => line && !/^\\(?:notag|nonumber)\b/.test(line));
-  return style + (lines.join(" ") || math.replace(/\s+/g, " "));
+  // Keep line endings: joining a TeX comment to the next line would silently
+  // comment out the rest of a multiline equation.
+  return style + (lines.join("\n") || math);
 }
 
 // ---------------------------------------------------------------------------
-// Render one equation. Fresh adaptor per call, so a \newcommand the user
-// edits in their buffer correctly invalidates without daemon restart.
+// Render one equation. A fresh TeX input jax per request isolates definitions,
+// colors, package options and labels, including definitions inside equations.
+// Adaptors do not hold macro state; the shared adaptor and font are safe to
+// reuse across the daemon's sequential requests.
 // ---------------------------------------------------------------------------
 async function renderOne({ preamble, equation, display, color, font_size, display_math_style, ex }) {
   if (!MJ) throw new Error("mathjax not booted");
-  const { mathjax, TeX, SVG, liteAdaptor, packages } = MJ;
+  const { mathjax, TeX, SVG, adaptor, fontData, packages, STATE } = MJ;
 
-  const adaptor = liteAdaptor();
-  const tex = new TeX({
-    packages,
-    macros: {
-      // LaTeX's bm package defines \bm. MathJax has \boldsymbol, so provide
-      // the common alias explicitly for notes that use \usepackage{bm}.
-      bm: ["\\boldsymbol{#1}", 1],
-    },
-    formatError: (jax, err) => { throw err; },
+  const makeDocument = () => mathjax.document("", {
+    InputJax: new TeX({
+      packages,
+      macros: {
+        // LaTeX's bm package defines \bm. MathJax has \boldsymbol.
+        bm: ["\\boldsymbol{#1}", 1],
+      },
+      formatError: (jax, err) => { throw err; },
+    }),
+    OutputJax: new SVG({
+      fontData,
+      fontCache: "local",
+      linebreaks: { inline: false },
+    }),
   });
-  const svg = new SVG({
-    fontCache: "local",
-    linebreaks: { inline: false },
-  });
-  const html = mathjax.document("", { InputJax: tex, OutputJax: svg });
+  let html = makeDocument();
 
   const em = Number(font_size) > 0 ? Number(font_size) : 11;
   const opts = { display: false, em, ex: ex || em / 2, containerWidth: 1280 };
@@ -331,15 +347,19 @@ async function renderOne({ preamble, equation, display, color, font_size, displa
   // takes raw math content (no \(...\) or \[...\] delimiters) and
   // processes it in math mode; the `newcommand` package handles bare
   // \newcommand / \def / \let / \DeclareMathOperator definitions in math
-  // mode with no wrapping needed. We pass everything as one string first
-  // (one MathJax invocation = ~3ms), then on error fall back to per-line
-  // parsing so a single bad line doesn't lose all the good ones.
+  // mode with no wrapping needed. Stop after compilation: generating SVG for
+  // these discarded definitions adds work and may load unnecessary glyphs.
+  // Try one string first, then recover individual blocks on errors.
   if (preamble && preamble.trim()) {
     try {
-      await html.convertPromise(preamble, opts);
+      await html.convertPromise(preamble, { ...opts, end: STATE.COMPILED });
     } catch {
+      // A failed parse can already have applied definitions. Replay from a
+      // clean context so, for example, \let cannot copy a partially redefined
+      // macro from the failed attempt.
+      html = makeDocument();
       for (const block of splitPreambleBlocks(preamble)) {
-        try { await html.convertPromise(block, opts); } catch { /* swallow */ }
+        try { await html.convertPromise(block, { ...opts, end: STATE.COMPILED }); } catch { /* swallow */ }
       }
     }
   }
@@ -403,6 +423,10 @@ async function runDaemon() {
       stdout.write(JSON.stringify({ ok: false, err: "bad json: " + e.message }) + "\n");
       continue;
     }
+    if (!req || typeof req !== "object" || Array.isArray(req)) {
+      stdout.write(JSON.stringify({ ok: false, err: "request must be a JSON object" }) + "\n");
+      continue;
+    }
     if (req.quit) { exit(0); }
     try {
       const svg = await renderOne(req);
@@ -436,8 +460,8 @@ async function runOneShot(opts) {
   // intermediate files still get correct behavior.
   const noMeta = raw.replace(/^%%\s*(latex-preview|snacks-mathjax):[^\n]*\n/, "");
   const m = noMeta.split(SPLIT);
-  const preamble = (m[0] || "").trim();
-  const equation = (m[1] || m[0] || "").trim();
+  const preamble = m.length > 1 ? m[0].trim() : "";
+  const equation = (m.length > 1 ? m[1] : m[0]).trim();
   const svg = await renderOne({
     preamble, equation,
     display: opts.display, color: opts.color, ex: opts.ex,

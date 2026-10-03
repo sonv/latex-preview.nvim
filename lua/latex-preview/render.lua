@@ -50,7 +50,8 @@ local function cleanup_stale_temp_dirs()
 end
 
 local function temp_render_stem(name)
-  return name:gsub("%.tmp$", ""):gsub("%.[^.]+$", "")
+  return name:gsub("%.tmp%.tmp$", ".tmp"):gsub("%.%d+%.tmp$", "")
+    :gsub("%.tmp$", ""):gsub("%.[^.]+$", "")
 end
 
 local function temp_cache_group(name, names)
@@ -126,9 +127,11 @@ local function trim_temp_cache(max_files, max_bytes, grace_ms)
   local now_sec = os.time()
   local entries = {}
   local next_retry_ms = nil
-  for _, group in pairs(groups) do
+  for key, group in pairs(groups) do
     local age_ms = (now_sec - group.mtime) * 1000
-    if age_ms >= grace_ms then
+    if pending[temp_dir() .. "/" .. key .. ".png"] then
+      next_retry_ms = 250
+    elseif age_ms >= grace_ms then
       entries[#entries + 1] = group
     else
       local remaining = grace_ms - age_ms
@@ -220,13 +223,29 @@ local function should_pad_to_cells(req)
   return config.options.render.pad_to_cells == true
 end
 
+local function terminal_cells()
+  local ok, snacks = pcall(require, "snacks")
+  if not ok or not snacks.image or not snacks.image.terminal then return end
+  local term = snacks.image.terminal.size()
+  if not term then return end
+  local width, height = tonumber(term.cell_width), tonumber(term.cell_height)
+  if width and height and width > 0 and height > 0 then
+    return { width = width, height = height }
+  end
+end
+
+local function rasterizer()
+  local tool = config.options.render.svg_to_png
+  if tool == "auto" then
+    tool = vim.fn.executable("rsvg-convert") == 1 and "rsvg" or "magick"
+  end
+  return tool
+end
+
 ---@param req { preamble: string, equation: string, display: boolean, pad_to_cells: boolean? }
 ---@return string  cache key suitable for use as a filename stem
-local function cache_key(req)
-  local renderer_version = "raster-v9-mathjax4"
-  local fg = config.get_fg()
-  local font_size = effective_font_size(req)
-  local density = effective_density(req)
+local function cache_key(req, settings)
+  local renderer_version = "raster-v10-mathjax4"
   -- Avoid \0 separators because vim.fn.sha256 treats embedded NULs as a
   -- Blob signal and refuses string input. Newlines are safe and the
   -- collision risk is negligible for our use.
@@ -234,11 +253,14 @@ local function cache_key(req)
     req.preamble or "",
     req.equation or "",
     req.display and "1" or "0",
-    fg,
-    tostring(font_size),
-    tostring(config.options.render.display_math_style),
-    tostring(should_pad_to_cells(req)),
-    tostring(density),
+    settings.fg,
+    tostring(settings.font_size),
+    tostring(settings.display_math_style),
+    tostring(settings.pad),
+    tostring(settings.density),
+    settings.tool,
+    settings.cells and tostring(settings.cells.width) or "",
+    settings.cells and tostring(settings.cells.height) or "",
     renderer_version,
   }, "\n--latex-preview--\n")
   return vim.fn.sha256(raw):sub(1, 16)
@@ -308,22 +330,24 @@ end
 ---@param png_path string
 ---@param density integer
 ---@param cb fun(err: string?)
-local function svg_to_png(svg_path, png_path, density, cb)
-  local tool = config.options.render.svg_to_png
-  if tool == "auto" then
-    tool = vim.fn.executable("rsvg-convert") == 1 and "rsvg" or "magick"
-  end
+local function svg_to_png(svg_path, png_path, settings, size, cb)
+  local tool, density = settings.tool, settings.density
   if tool == "rsvg" then
     -- rsvg-convert handles MathJax's SVG/currentColor output reliably.
     local zoom = density / 96
-    spawn("rsvg-convert", {
+    local args = {
       "-d", tostring(density),
       "-p", tostring(density),
-      "-z", tostring(zoom),
       "-b", "transparent",
       "-o", png_path,
-      svg_path,
-    }, function(err) cb(err) end)
+    }
+    if size then
+      vim.list_extend(args, { "-w", tostring(size.width), "-h", tostring(size.height) })
+    else
+      vim.list_extend(args, { "-z", tostring(zoom) })
+    end
+    args[#args + 1] = svg_path
+    spawn("rsvg-convert", args, function(err) cb(err) end)
   else
     -- ImageMagick. Either `magick` (v7) or `convert` (v6) exists.
     local bin = vim.fn.executable("magick") == 1 and "magick" or "convert"
@@ -332,7 +356,7 @@ local function svg_to_png(svg_path, png_path, density, cb)
       "-background", "none",
       svg_path,
       "-trim",
-      png_path,
+      "PNG:" .. png_path,
     }, function(err) cb(err) end)
   end
 end
@@ -344,7 +368,7 @@ local function png_size(png_path)
   if not fd then return nil, nil end
   local header = fd:read(24)
   fd:close()
-  if not header or header:sub(1, 8) ~= "\137PNG\r\n\26\n" then
+  if not header or #header < 24 or header:sub(1, 8) ~= "\137PNG\r\n\26\n" then
     return nil, nil
   end
   local width = header:byte(17) * 16777216 + header:byte(18) * 65536
@@ -356,16 +380,13 @@ end
 
 ---@param png_path string
 ---@param cb fun(err: string?)
-local function pad_to_cells(png_path, cb)
-  local ok, snacks = pcall(require, "snacks")
-  if not ok or not snacks.image or not snacks.image.terminal then return cb(nil) end
-  local term = snacks.image.terminal.size()
-  if not term or not term.cell_width or not term.cell_height then return cb(nil) end
+local function pad_to_cells(png_path, cells, cb)
+  if not cells then return cb(nil) end
 
   local width, height = png_size(png_path)
   if not width or not height then return cb(nil) end
-  local target_width = math.max(1, math.ceil(width / term.cell_width) * term.cell_width)
-  local target_height = math.max(1, math.ceil(height / term.cell_height) * term.cell_height)
+  local target_width = math.max(1, math.ceil(math.ceil(width / cells.width) * cells.width))
+  local target_height = math.max(1, math.ceil(math.ceil(height / cells.height) * cells.height))
   if target_width == width and target_height == height then return cb(nil) end
 
   local bin = vim.fn.executable("magick") == 1 and "magick"
@@ -389,7 +410,7 @@ local function pad_to_cells(png_path, cb)
     "-background", "none",
     "-gravity", "center",
     "-extent", ("%dx%d"):format(target_width, target_height),
-    tmp,
+    "PNG:" .. tmp,
   }, function(err)
     if err then
       pcall(os.remove, tmp)
@@ -403,15 +424,43 @@ local function pad_to_cells(png_path, cb)
   end)
 end
 
+-- Give librsvg the final canvas up front, avoiding a second process and PNG
+-- decode/encode just to add transparent padding. Keep the inner viewport at
+-- its original scale so padding does not stretch the equation.
+local function pad_svg(svg, settings)
+  if settings.tool ~= "rsvg" or not settings.cells then return svg end
+  local root = svg:match("<svg%s[^>]*>")
+  if not root then return svg end
+  local width = tonumber(root:match('%swidth="([%d%.]+)px"'))
+  local height = tonumber(root:match('%sheight="([%d%.]+)px"'))
+  if not width or not height or width <= 0 or height <= 0 then return svg end
+  local zoom = settings.density / 96
+  width, height = width * zoom, height * zoom
+  local cells = settings.cells
+  local target_width = math.ceil(math.ceil(math.ceil(width) / cells.width) * cells.width)
+  local target_height = math.ceil(math.ceil(math.ceil(height) / cells.height) * cells.height)
+  local x = math.floor((target_width - math.ceil(width)) / 2)
+  local y = math.floor((target_height - math.ceil(height)) / 2)
+  local inner = root:gsub('%swidth="[^"]*"', (' width="%.9fpx"'):format(width), 1)
+    :gsub('%sheight="[^"]*"', (' height="%.9fpx"'):format(height), 1)
+    :gsub("<svg", ('<svg x="%d" y="%d"'):format(x, y), 1)
+  local start = svg:find("<svg", 1, true)
+  local body = inner .. svg:sub(start + #root)
+  return ('<?xml version="1.0" encoding="UTF-8"?>\n'
+    .. '<svg xmlns="http://www.w3.org/2000/svg" width="%dpx" height="%dpx">%s</svg>')
+    :format(target_width, target_height, body), { width = target_width, height = target_height }
+end
+
 -- Public API ----------------------------------------------------------------
 
----Render an equation to a PNG. If already cached, calls cb synchronously
+---Render an equation to a PNG. If already cached, calls cb
 ---with the cached path on the next tick. Otherwise dispatches to the
 ---daemon → rasterizer pipeline.
 ---
 ---@param req { preamble: string, equation: string, display: boolean, buf: integer?, live: boolean?, live_id: integer?, font_size: integer?, pad_to_cells: boolean? }
 ---@param cb fun(err: string?, png_path: string?)
 function M.render(req, cb)
+  req = vim.tbl_extend("force", {}, req)
   -- Resolve buf eagerly to a real buffer ID. req.buf is optional for
   -- backward compatibility and for tests; when omitted we snap to the
   -- active buffer once, here, so every downstream check (buf_modified,
@@ -421,10 +470,17 @@ function M.render(req, cb)
   if not buf or buf == 0 then buf = vim.api.nvim_get_current_buf() end
   req.buf = buf
   local buf_modified = vim.api.nvim_buf_is_valid(buf) and vim.bo[buf].modified
-  local key = cache_key(req)
+  -- Snapshot settings once. A density/theme change while the daemon is busy
+  -- must not put the new output under the old settings' cache key.
+  local pad = should_pad_to_cells(req)
+  local settings = {
+    fg = config.get_fg(), font_size = effective_font_size(req),
+    density = effective_density(req), display_math_style = config.options.render.display_math_style,
+    pad = pad, cells = pad and terminal_cells() or nil, tool = rasterizer(),
+  }
+  local key = cache_key(req, settings)
   local use_cache = config.options.cache and not buf_modified
-  local use_reusable_temp = not use_cache and req.live
-  local can_reuse = use_cache or use_reusable_temp
+  local use_reusable_temp = not use_cache
   local svg_path
   local png_path
   if use_cache then
@@ -432,34 +488,35 @@ function M.render(req, cb)
     svg_path = dir .. "/" .. key .. ".svg"
     png_path = dir .. "/" .. key .. ".png"
   else
-    local stem = temp_stem(buf, use_reusable_temp and ("live-" .. key) or req.live_id)
+    local stem = temp_stem(buf, "live-" .. key)
     svg_path = stem .. ".svg"
     png_path = stem .. ".png"
   end
+  local staged_png = png_path .. "." .. tostring(uv.os_getpid()) .. ".tmp"
 
-  if can_reuse and pending[png_path] then
+  if pending[png_path] then
     pending[png_path][#pending[png_path] + 1] = cb
     return
   end
 
   -- Cache hit? Check the PNG specifically — if the SVG is there but the
   -- PNG isn't, the rasterizer crashed mid-step and we want to retry.
-  if can_reuse and uv.fs_stat(png_path) then
+  if uv.fs_stat(png_path) then
     if use_reusable_temp then schedule_temp_cache_limit_check() end
     return vim.schedule(function() cb(nil, png_path) end)
   end
 
-  if can_reuse then
-    pending[png_path] = { cb }
-  end
+  pending[png_path] = { cb }
 
   local function finish(err, path)
     if use_reusable_temp and not err then schedule_temp_cache_limit_check() end
-    if not can_reuse then return cb(err, path) end
     local callbacks = pending[png_path] or { cb }
     pending[png_path] = nil
     for _, waiter in ipairs(callbacks) do
-      waiter(err, path)
+      local ok, callback_err = pcall(waiter, err, path)
+      if not ok then
+        vim.schedule(function() error(callback_err) end)
+      end
     end
   end
 
@@ -468,35 +525,48 @@ function M.render(req, cb)
   -- a half-written SVG without a PNG signals to the next call that the
   -- rasterizer crashed and the request should be retried.
   local function cleanup_temps()
+    pcall(os.remove, staged_png)
+    pcall(os.remove, staged_png .. ".tmp")
     if not use_cache then
       pcall(os.remove, svg_path)
       pcall(os.remove, png_path)
     end
   end
 
-  local fg_hex = config.get_fg():gsub("^#", "")
+  local function publish()
+    local ok, rename_err = os.rename(staged_png, png_path)
+    if not ok then
+      cleanup_temps()
+      return finish("cannot publish PNG: " .. tostring(rename_err), nil)
+    end
+    finish(nil, png_path)
+  end
+
+  local fg_hex = settings.fg:gsub("^#", "")
   daemon.render({
     preamble = req.preamble or "",
     equation = req.equation,
     display = req.display,
     color = fg_hex,
-    font_size = effective_font_size(req),
-    display_math_style = config.options.render.display_math_style,
+    font_size = settings.font_size,
+    display_math_style = settings.display_math_style,
   }, function(err, svg)
     if err then cleanup_temps(); return finish(err, nil) end
     if not svg then cleanup_temps(); return finish("daemon returned no svg", nil) end
+    local size
+    svg, size = pad_svg(svg, settings)
     -- Write SVG.
     local fd = io.open(svg_path, "w")
     if not fd then cleanup_temps(); return finish("cannot open " .. svg_path .. " for write", nil) end
     fd:write(svg)
     fd:close()
     -- Rasterize.
-    svg_to_png(svg_path, png_path, effective_density(req), function(rerr)
+    svg_to_png(svg_path, staged_png, settings, size, function(rerr)
       if rerr then cleanup_temps(); return finish(rerr, nil) end
-      if not should_pad_to_cells(req) then return finish(nil, png_path) end
-      pad_to_cells(png_path, function(perr)
+      if not settings.pad or size then return publish() end
+      pad_to_cells(staged_png, settings.cells, function(perr)
         if perr then cleanup_temps(); return finish(perr, nil) end
-        finish(nil, png_path)
+        publish()
       end)
     end)
   end)

@@ -7,9 +7,8 @@
 -- equation-render requests over its stdin/stdout pipes via newline-
 -- delimited JSON.
 --
--- This exists because spawning Node + loading MathJax per equation
--- costs ~1.5 s per call. With a persistent daemon, per-equation latency
--- drops to ~10-50 ms, which is what live preview needs.
+-- Keeping Node and MathJax loaded avoids startup and font initialization
+-- on every equation, making repeated previews substantially faster.
 --
 -- Lifecycle:
 --   * lazy spawn on first M.render() call
@@ -53,6 +52,9 @@ local state = {
   stderr_buf = "",
   restart_count = 0,
   cmd = nil,
+  generation = 0,
+  ready_timer = nil,
+  restart_timer = nil,
 }
 
 local function close(h)
@@ -61,14 +63,13 @@ end
 
 ---Reset state. Rejects in-flight + queued callbacks.
 local function reset(reason)
-  for id, cb in pairs(state.pending) do
-    pcall(cb, reason or "daemon stopped", nil)
-    state.pending[id] = nil
-  end
-  for _, q in ipairs(state.queue) do
-    pcall(q.cb, reason or "daemon stopped", nil)
-  end
-  state.queue = {}
+  -- Detach the old generation before invoking callbacks: a callback may
+  -- immediately submit another render and start a replacement daemon.
+  local pending, queue = state.pending, state.queue
+  state.pending, state.queue = {}, {}
+  state.generation = state.generation + 1
+  close(state.ready_timer); close(state.restart_timer)
+  state.ready_timer, state.restart_timer = nil, nil
   close(state.stdin); close(state.stdout); close(state.stderr); close(state.handle)
   state.stdin, state.stdout, state.stderr, state.handle = nil, nil, nil, nil
   state.ready = false
@@ -76,6 +77,12 @@ local function reset(reason)
   state.stdout_buf = ""
   state.stderr_buf = ""
   state.next_id = 0
+  for _, cb in pairs(pending) do
+    pcall(cb, reason or "daemon stopped", nil)
+  end
+  for _, q in ipairs(queue) do
+    pcall(q.cb, reason or "daemon stopped", nil)
+  end
 end
 
 ---Resolve the daemon command via config or runtimepath lookup.
@@ -112,6 +119,8 @@ local function on_line(line)
     return
   end
   if msg.ready then
+    close(state.ready_timer)
+    state.ready_timer = nil
     state.ready = true
     state.starting = false
     state.restart_count = 0
@@ -165,6 +174,10 @@ local function spawn()
   end
 
   state.starting = true
+  close(state.restart_timer)
+  state.restart_timer = nil
+  state.generation = state.generation + 1
+  local generation = state.generation
   state.stdin = assert(uv.new_pipe())
   state.stdout = assert(uv.new_pipe())
   state.stderr = assert(uv.new_pipe())
@@ -178,11 +191,14 @@ local function spawn()
     hide = true,
   }, function(code, signal)
     vim.schedule(function()
+      if state.generation ~= generation then return end
       local err_msg = ("daemon exited code=%d signal=%d"):format(code or -1, signal or 0)
       if state.stderr_buf ~= "" then
         err_msg = err_msg .. "\nstderr: " .. state.stderr_buf:sub(1, 400)
       end
       reset(err_msg)
+      -- A rejected render callback may already have started a replacement.
+      if state.generation ~= generation + 1 or state.handle or state.starting then return end
       local cfg = config.options.daemon
       if (code or 0) ~= 0 and state.restart_count < cfg.max_restarts then
         state.restart_count = state.restart_count + 1
@@ -191,7 +207,12 @@ local function spawn()
             .. "\nrestart " .. state.restart_count .. "/" .. cfg.max_restarts,
           vim.log.levels.WARN
         )
-        vim.defer_fn(spawn, 200 * state.restart_count)
+        local restart_generation = state.generation
+        state.restart_timer = vim.defer_fn(function()
+          if state.generation ~= restart_generation then return end
+          state.restart_timer = nil
+          spawn()
+        end, 200 * state.restart_count)
       end
     end)
   end)
@@ -202,11 +223,14 @@ local function spawn()
   end
 
   state.stdout:read_start(function(_, data)
-    if data then vim.schedule(function() on_stdout_chunk(data) end) end
+    if data then vim.schedule(function()
+      if state.generation == generation then on_stdout_chunk(data) end
+    end) end
   end)
   state.stderr:read_start(function(_, data)
     if data then
       vim.schedule(function()
+        if state.generation ~= generation then return end
         state.stderr_buf = (state.stderr_buf .. data):sub(-2048)
       end)
     end
@@ -214,22 +238,22 @@ local function spawn()
 
   -- Ready timeout — fail loudly if @mathjax/src isn't installed.
   local timer = assert(uv.new_timer())
+  state.ready_timer = timer
   timer:start(config.options.daemon.ready_timeout_ms, 0, function()
-    timer:stop(); timer:close()
-    if not state.ready and state.handle then
-      vim.schedule(function()
-        if state.ready then return end
-        local hint = state.stderr_buf ~= ""
-          and ("\n" .. state.stderr_buf:sub(1, 400))
-          or "\n(install with `npm install -g @mathjax/src@4`)"
-        vim.notify(
-          "[latex-preview] daemon failed to become ready within "
-            .. config.options.daemon.ready_timeout_ms .. " ms" .. hint,
-          vim.log.levels.ERROR
-        )
-        if state.handle then state.handle:kill("sigterm") end
-      end)
-    end
+    close(timer)
+    vim.schedule(function()
+      if state.generation ~= generation or state.ready or not state.handle then return end
+      state.ready_timer = nil
+      local hint = state.stderr_buf ~= ""
+        and ("\n" .. state.stderr_buf:sub(1, 400))
+        or "\n(install with `npm install -g @mathjax/src@4`)"
+      vim.notify(
+        "[latex-preview] daemon failed to become ready within "
+          .. config.options.daemon.ready_timeout_ms .. " ms" .. hint,
+        vim.log.levels.ERROR
+      )
+      if state.handle then state.handle:kill("sigterm") end
+    end)
   end)
 
   if not autocmd_registered then
@@ -260,6 +284,7 @@ function M.render(req, cb)
     return
   end
   local id = state.next_id
+  local generation = state.generation
   state.next_id = state.next_id + 1
   state.pending[id] = cb
   local payload = vim.json.encode({
@@ -274,6 +299,7 @@ function M.render(req, cb)
   state.stdin:write(payload, function(err)
     if err then
       vim.schedule(function()
+        if state.generation ~= generation then return end
         local pending_cb = state.pending[id]
         if pending_cb then
           state.pending[id] = nil
@@ -289,10 +315,9 @@ function M.shutdown()
   if state.stdin and not state.stdin:is_closing() then
     pcall(function() state.stdin:write(vim.json.encode({ quit = true }) .. "\n") end)
   end
-  local h = state.handle
-  vim.defer_fn(function()
-    if h and not h:is_closing() then pcall(function() h:kill("sigterm") end) end
-  end, 200)
+  -- Kill before closing the process handle, otherwise a daemon that ignores
+  -- the quit message can outlive Neovim with no handle left to terminate it.
+  if state.handle then pcall(function() state.handle:kill("sigterm") end) end
   reset("vim shutdown")
 end
 

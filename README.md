@@ -1,500 +1,193 @@
 # latex-preview.nvim
 
-## Vibe code project: I used Claude to make initial code and ChatGPT 5.5 to optimize.
+Preview LaTeX math while you write in Neovim. Open a floating window at the
+cursor, edit the source, and watch the equation update. The same preview
+can show referenced equations, theorem statements, and BibTeX entries.
 
-Inspired by Overleaf's functionality.
+MathJax runs in a persistent Node.js process, with custom macros collected
+from your project. [snacks.nvim](https://github.com/folke/snacks.nvim)
+handles image placement in the terminal. No LaTeX compilation is needed
+for previews.
 
-This is a hover-style LaTeX math preview for Neovim that can **live update while typing, show referenced equations, theorems, and citations**.
-Press a key inside a math expression and a small floating window pops up with the rendered equation —
-the way Overleaf shows preview tooltips on hover.
+https://github.com/user-attachments/assets/e3509a2d-eaf1-4c1c-afde-d3f3ab90c7da
 
+More demos: [Equation editing](https://youtu.be/Naqs8XSB0ko) ·
+[Reference demo](https://youtu.be/VaEr1X8wXLw)
 
-It renders via MathJax in a long-running Node daemon. Pulls custom macros
-from your buffer and any local `.sty` files automatically. 
-
-**WARNING**: This plugin only works with terminal that support graphics such as Kitty or iTerm2, WezTerm, Ghostty.
-Personally, I've only tested with Kitty, however. 
-
-
-## What it looks like
-
-
-[Demo of equation display and live update](https://youtu.be/Naqs8XSB0ko)
-
-[Demo of displaying references](https://youtu.be/VaEr1X8wXLw)
-
-
-## Why this design
-
-Inline preview ("show the rendered image right where the source is") is
-beautiful when it works but operationally hard: it has to fight Neovim's
-redraws, scrolling, visual selection, undo, and split windows.
-
-Hover preview is much simpler. The popup only exists while you're
-deliberately looking at it, closes the moment you move the cursor, and
-the rest of the time your buffer behaves like any other text file. It
-also works great for the actual use case: "wait, what does this
-equation look like?" — answer the question, get back to typing.
-
-## Why the snacks.nvim dependency?
-
-Putting an image in a Neovim floating window via the Kitty graphics
-protocol — handling the Unicode-placeholder layout, the diacritic
-encoding, the chunked transmission, the auto-resize on window changes,
-and the cleanup on close — is intricate code that snacks.nvim already
-solves correctly and maintains. Rather than ship a parallel
-implementation that subtly diverges, this plugin uses snacks's
-`image.placement` directly. It produces the rendered PNG via the
-MathJax daemon and hands the path to snacks.
-
-If you'd prefer no snacks dependency, use snacks-image's own math
-preview. The trade-off is that snacks renders math via `pdflatex`
-(~500-2000 ms per equation) rather than MathJax (~10-50 ms), which is
-fine for occasional preview but too slow for live editing.
+[Install](#install) · [Usage](#usage) · [Configuration](#configuration) ·
+[Macros and projects](#macros-and-projects) · [Performance](#performance) ·
+[Troubleshooting](#troubleshooting)
 
 ## Requirements
 
-- **Neovim 0.10+**
-- **[snacks.nvim](https://github.com/folke/snacks.nvim)** with `image.enabled = true` (the renderer + placement engine)
-- **Node.js 18+**
-- **A graphics-capable terminal**: Kitty, iTerm2, WezTerm, or Ghostty
-- **`@mathjax/src` 4.x** (npm): `npm install -g @mathjax/src@4`
-- **An SVG rasterizer**: `rsvg-convert` / librsvg (**strongly recommended** — handles MathJax SVG and `currentColor` correctly); ImageMagick is a fallback but may silently produce blank or corrupt output on complex equations
+- Neovim 0.10+.
+- [snacks.nvim](https://github.com/folke/snacks.nvim), with `image.enabled = true`.
+- A terminal supported by Snacks' Kitty graphics backend. **I have tested
+  this plugin in Kitty.** Other terminals depend on Snacks' support. See its
+  [terminal compatibility notes](https://github.com/folke/snacks.nvim/blob/main/docs/image.md).
+- Node.js 18+ and MathJax 4's `@mathjax/src` package.
+- `rsvg-convert` from librsvg, recommended for reliable SVG rasterization.
+  ImageMagick is a fallback, but some MathJax SVGs may render incorrectly
+  without librsvg.
 
-### Linux
+Treesitter parsers for `latex` and `markdown_inline` improve equation
+lookup. They are optional. The plugin uses a regex fallback when they are
+unavailable.
+
+## Install
+
+Install the rendering tools first. ImageMagick is included below for
+Snacks' other image formats and as a fallback rasterizer.
 
 ```sh
-sudo apt install nodejs imagemagick librsvg2-bin
-sudo npm install -g @mathjax/src@4
-```
-
-### macOS
-
-```sh
+# macOS
 brew install node imagemagick librsvg
 npm install -g @mathjax/src@4
 ```
 
-Run `:checkhealth latex-preview` after install to verify.
-
-### Upgrading from MathJax 3
-
-Older versions used `mathjax-full@3`. This plugin now requires MathJax 4's
-`@mathjax/src` package instead:
-
 ```sh
+# Debian / Ubuntu, with Node.js 18+ available
+sudo apt install nodejs npm imagemagick librsvg2-bin
 npm install -g @mathjax/src@4
 ```
 
-The old `mathjax-full` package can stay installed, but it is no longer used
-by the daemon or `:checkhealth latex-preview`.
+Use your usual npm global-install prefix. If MathJax is installed elsewhere,
+set `LATEX_PREVIEW_MATHJAX_PATH` to the directory containing its
+`package.json`. Older installations of `mathjax-full@3` are no longer used.
 
-## Install
-
-### lazy.nvim
+Add this to your lazy.nvim configuration:
 
 ```lua
 {
-  "your-username/latex-preview.nvim",
-  dependencies = { "folke/snacks.nvim" },
+  "sonv/latex-preview.nvim",
+  dependencies = {
+    { "folke/snacks.nvim", opts = { image = { enabled = true } } },
+  },
   ft = { "tex", "latex", "markdown", "rmd", "quarto" },
   opts = {
-    setup_keymap = true,   -- bind <leader>ih in supported filetypes
-    cache = true,          -- persist renders to disk
-    cache_dir = "aux",     -- default: <texfile-dir>/aux/latex-preview-cache/
+    setup_keymap = true,             -- <leader>ih: inspect here
+    hover = { auto_open = false },   -- open previews with the keymap
+    cache = true,                   -- reuse saved-buffer renders across sessions
+    cache_dir = "aux",              -- <buffer-directory>/aux/latex-preview-cache/
   },
 }
 ```
 
-That's the recommended LaTeX-project setup: `<leader>ih` toggles the
-popup, and rendered images are cached alongside your build artifacts in
-`aux/latex-preview-cache/` rather than a global directory.
+If you already configure Snacks, merge `image.enabled = true` into that
+configuration. For another plugin manager, install `sonv/latex-preview.nvim`
+and `folke/snacks.nvim`, then call `require("latex-preview").setup({...})`.
 
-Make sure your snacks.nvim setup has `image.enabled = true`. If you're
-already using snacks, you probably do.
-
-To make the popup stay on automatically as you move through math, use
-Snacks' document float option:
-
-```lua
-require("snacks").setup({
-  image = {
-    enabled = true,
-    doc = {
-      inline = false,
-      float = true,
-    },
-  },
-})
-```
-
-### packer.nvim
-
-```lua
-use {
-  "your-username/latex-preview.nvim",
-  config = function() require("latex-preview").setup({}) end,
-}
-```
-
-### Manual
-
-```sh
-git clone https://github.com/your-username/latex-preview.nvim \
-  ~/.local/share/nvim/site/pack/plugins/start/latex-preview.nvim
-```
+Run `:checkhealth latex-preview`, open a supported file, place the cursor
+inside an equation, and press `<leader>ih`.
 
 ## Usage
 
-| Command | Action |
+The preview follows the target under the cursor while it is open. You can
+move and edit within an equation, or jump directly to another supported
+target. Moving to ordinary text or leaving the buffer closes the popup.
+Press `<leader>ih` again to close it manually.
+
+To open previews automatically as you move, set
+`hover = { auto_open = true }` or run `:LatexPreview auto-on`. When
+`hover.auto_open` is omitted, the plugin follows Snacks' `image.doc.float`
+setting. With automatic hover enabled, cursor movement can reopen a
+preview you closed manually.
+
+When `setup_keymap = true`, these normal-mode mappings are installed:
+
+| Key | Action |
 |---|---|
-| `:LatexPreview` (or `:LatexPreview toggle`) | Show or close the popup |
-| `:LatexPreview show` | Show the popup |
-| `:LatexPreview close` | Close it |
-| `:LatexPreview auto` | Toggle automatic hover on/off |
-| `:LatexPreview auto-on` | Enable automatic hover |
-| `:LatexPreview auto-off` | Disable automatic hover |
-| `:LatexPreview refs` | Toggle previews for referenced equations under `\ref` / `\eqref` |
-| `:LatexPreview refs-on` | Enable referenced-equation previews |
-| `:LatexPreview refs-off` | Disable referenced-equation previews |
-| `:LatexPreview thms` | Toggle previews for referenced theorem-like environments |
-| `:LatexPreview thms-on` | Enable theorem-like reference previews |
-| `:LatexPreview thms-off` | Disable theorem-like reference previews |
-| `:LatexPreview cites` | Toggle citation previews under `\cite...` commands |
-| `:LatexPreview cites-on` | Enable citation previews |
-| `:LatexPreview cites-off` | Disable citation previews |
-| `:LatexPreview density [N\|reset]` | Set/show the current buffer's render density override |
-| `:LatexPreview display-density [N\|reset]` | Set/show the current buffer's display-equation density override |
-| `:LatexPreview clear` | Delete cached SVG/PNG files |
-| `:LatexPreview stop` | Stop the daemon (auto-respawns next render) |
-| `:LatexPreview status` | Print daemon and popup state |
-| `:LatexPreview debug` | Open a scratch buffer dumping what would be sent to the daemon for the equation under the cursor — useful for figuring out why a custom macro isn't being picked up |
+| `<leader>ih` | Show or close the preview in supported filetypes |
+| `<leader>iH` | Toggle automatic hover |
+| `<leader>ir` | Toggle referenced-equation previews |
+| `<leader>it` | Toggle theorem-reference previews |
+| `<leader>ic` | Toggle citation previews |
 
-The popup is a **toggle**: pressing the keymap (or running `:LatexPreview`)
-opens the preview if you're inside an equation, and closes it if it's
-already open.
+### References and citations
 
-Once open, the popup **stays put while your cursor is inside the
-equation**. You can edit, move within the equation, scan around — the
-preview keeps tracking. As soon as your cursor moves *outside* the
-equation, the popup auto-closes. Pressing the toggle key again works
-the same as moving out and re-entering.
+The plugin checks for a math expression first, then a referenced equation,
+a theorem reference, and finally a citation. Reference and citation
+previews are enabled by default.
 
-The hover target is chosen in this order:
+- **Equations:** `\ref`, `\eqref`, `\autoref`, `\cref`, `\Cref`, `\vref`,
+  and `\Vref` look up a matching `\label` in the current buffer.
+- **Theorems:** the same commands preview labeled `theorem`, `lemma`,
+  `proposition`, and `definition` blocks. Common aliases such as `thm`
+  and `lem` are recognized, including declarations with `\newtheorem`.
+  The body is shown as source text with its math rendered in place.
+- **Citations:** commands containing `cite`, such as `\cite`, `\citet`,
+  `\citep`, `\parencite`, and `\textcite`, show the matching BibTeX entry.
+  Local `.bib` files must be listed with `\bibliography` or
+  `\addbibresource` in the current buffer. For multiple keys, the key
+  under the cursor is selected when possible, otherwise the first is used.
 
-1. A math expression under the cursor renders as an equation preview.
-2. A reference command such as `\ref{...}`, `\eqref{...}`, `\cref{...}`,
-   or `\autoref{...}` previews the labeled equation when
-   `references.enabled = true`.
-3. The same reference commands preview labeled theorem, lemma,
-   proposition, and definition environments when
-   `theorem_references.enabled = true`.
-4. A citation command such as `\cite{...}` or `\parencite{...}` previews
-   the matching BibTeX entry when `citations.enabled = true`.
+Target lookup is local and static. It does not search other chapters for
+labels, inherit bibliography declarations from the root file, expand
+generated labels, or resolve advanced bibliography inheritance.
 
-Referenced equations are resolved from `\label{...}` commands inside
-equation environments in the current buffer. Theorem-like references are
-resolved from `\label{...}` commands inside `theorem`, `lemma`,
-`proposition`, and `definition` environments, shown as source text, and any
-inline or display math inside the block is rendered in place with MathJax.
-Citations are resolved from local `.bib` files listed with
-`\bibliography{...}` or `\addbibresource{...}`.
+### Commands
 
-Display equations use LaTeX display style by default. Physical line
-breaks in your source are treated as spaces, so wrapped source does not
-force a multi-line render. If you want multiple rendered lines, use an
-explicit math environment such as `align`, `aligned`, `gather`, or
-`multline`.
+All commands start with `:LatexPreview`.
 
-### Keymapping
-
-The default keymap is `<leader>ih` (mnemonic: "inspect here"), bound in
-normal mode in supported filetypes when `setup_keymap = true`. If you'd
-rather use a different key (or several), set the `keymap` option:
-
-```lua
-require("latex-preview").setup({
-  setup_keymap = true,
-  keymap = "<leader>ih",            -- single key
-  -- keymap = { "<leader>ih", "K" },  -- or multiple
-})
-```
-
-If you want to wire it up yourself instead, the public API is:
-
-```lua
-require("latex-preview").toggle()  -- show or close
-require("latex-preview").hover()   -- show only (returns false if no math under cursor)
-require("latex-preview").close()   -- close only
-
-vim.keymap.set("n", "<leader>m", function()
-  require("latex-preview").toggle()
-end)
-```
-
-The reference/theorem/citation toggles can also be mapped automatically:
-
-```lua
-require("latex-preview").setup({
-  setup_keymap = true,
-  references = { toggle_keymap = "<leader>ir" },
-  theorem_references = { toggle_keymap = "<leader>it" },
-  citations = { toggle_keymap = "<leader>ic" },
-})
-```
+| Subcommand | Action |
+|---|---|
+| No argument, or `toggle` | Show or close the preview |
+| `show` / `close` | Show or close explicitly |
+| `auto` / `auto-on` / `auto-off` | Toggle, enable, or disable automatic hover |
+| `refs` / `refs-on` / `refs-off` | Toggle, enable, or disable equation references |
+| `thms` / `thms-on` / `thms-off` | Toggle, enable, or disable theorem references |
+| `cites` / `cites-on` / `cites-off` | Toggle, enable, or disable citations |
+| `density [N\|reset]` | Show, set, or reset the current buffer's density |
+| `display-density [N\|reset]` | Show, set, or reset its display-equation density |
+| `clear` | Clear the persistent cache directory used by the current buffer |
+| `stop` | Stop the daemon, which restarts on the next render |
+| `status` | Show daemon, popup, feature, and terminal-support state |
+| `debug` | Open a scratch buffer with the detected equations and extracted preamble |
 
 ## Configuration
 
+The installation example enables keymaps and persistent caching. Both
+are off in the plugin defaults. Most other settings can be left alone.
+
 ```lua
 require("latex-preview").setup({
-  enabled = true,
-  filetypes = { "tex", "latex", "markdown", "rmd", "quarto" },
-  setup_keymap = false,        -- install the toggle key automatically
-  keymap = "<leader>ih",       -- the toggle key (or list of keys)
-
-  -- Disk cache is off by default; live hover always uses temp files.
-  -- Set cache = true to persist renders across sessions.
-  cache = false,
-  -- Where to write cached SVG/PNG files. Three forms:
-  --   "aux" (default) — <texfile-dir>/aux/latex-preview-cache/
-  --                     (falls back to stdpath cache for unsaved buffers)
-  --   "/some/path"    — a fixed global directory for all buffers
-  --   function(buf)   — called per buffer, return an absolute path
-  cache_dir = "aux",
-
-  daemon = {
-    cmd = nil,                 -- override daemon command if needed
-    max_restarts = 3,
-    ready_timeout_ms = 8000,
-  },
-
-  extract = {
-    scan_sty = true,           -- find macros in local .sty files
-    sty_search_depth = 4,      -- walk up this many parent directories
-    rewrite_providecommand = true,  -- MathJax compat
-    rewrite_edef = true,       -- MathJax compat
-  },
-
-  render = {
-    fg = function()            -- defaults to current Normal hl fg
-      local hl = vim.api.nvim_get_hl(0, { name = "Normal" })
-      if hl and hl.fg then return string.format("#%06x", hl.fg) end
-      return "#000000"
-    end,
-    font_size = 12,            -- inline MathJax font size in pixels
-    display_font_size = 12,    -- display MathJax font size in pixels
-    display_math_style = "display", -- "display" for LaTeX display style, "text" for compact previews
-    pad_to_cells = true,       -- prevent terminal-cell rounding from enlarging short equations
-    density = 300,             -- DPI for SVG -> PNG
-    svg_to_png = "auto",       -- "auto", "rsvg", or "magick"
-  },
-
-  popup = {
-    -- Defaults to almost the full editor size. Lower these if you want
-    -- long equations scaled down instead of opening a larger popup.
-    max_width = nil,
-    max_height = nil,
-    live_update_delay_ms = 300,
-  },
-
+  setup_keymap = true,
+  keymap = "<leader>ih",       -- or { "<leader>ih", "K" }
   hover = {
-    auto_open = nil,        -- nil = follow Snacks image.doc.float
-    toggle_keymap = "<leader>iH", -- runtime auto-hover toggle when setup_keymap=true
+    auto_open = false,        -- true: automatic, omitted: follow Snacks
+    toggle_keymap = "<leader>iH",
   },
-
-  references = {
-    enabled = true,         -- preview equations referenced by \ref, \eqref, \cref, ...
-    toggle_keymap = "<leader>ir", -- runtime toggle when setup_keymap=true
+  popup = {
+    live_update_delay_ms = 300,
+    max_width = nil,          -- terminal cells, nil: nearly full editor width
+    max_height = nil,         -- terminal cells, nil: nearly full editor height
   },
-
-  theorem_references = {
-    enabled = true,         -- preview labeled theorem/lemma/proposition/definition blocks
-    toggle_keymap = "<leader>it", -- runtime toggle when setup_keymap=true
+  render = {
+    font_size = 12,
+    display_font_size = 12,
+    display_math_style = "display", -- or "text" for compact display equations
+    density = 300,
+    pad_to_cells = true,
+    svg_to_png = "auto",      -- prefer rsvg-convert, fall back to ImageMagick
   },
-
-  citations = {
-    enabled = true,         -- preview BibTeX entries referenced by \cite... commands
-    toggle_keymap = "<leader>ic", -- runtime toggle when setup_keymap=true
-  },
-
-  snacks = {
-    -- Keep snacks.image available for the explicit popup, but disable
-    -- Snacks' own document renderer that auto-renders every equation inline.
-    disable_document_images = true,
-    -- Empty Snacks' image cache on exit. The option name is kept for compatibility.
-    clean_info_on_exit = true,
-    -- Keep at most this many Snacks image cache entries, trimming oldest first.
-    -- Set <=0 to disable.
-    max_cache_files = 100,
-    -- Also trim oldest cache groups when the directory exceeds this size.
-    -- Set <=0 to disable.
-    max_cache_bytes = 50 * 1024 * 1024,
-    -- Never trim cache groups modified within this grace period.
-    cache_grace_ms = 5000,
-  },
-
-  -- Note: popup sizing, border, padding, and similar visual options still
-  -- come from your snacks.nvim image.doc config.
+  references = { enabled = true, toggle_keymap = "<leader>ir" },
+  theorem_references = { enabled = true, toggle_keymap = "<leader>it" },
+  citations = { enabled = true, toggle_keymap = "<leader>ic" },
 })
 ```
 
-## How macro detection works
+The foreground color follows the `Normal` highlight. Override it with
+`render.fg = "#RRGGBB"` or a function returning a color. Window styling,
+such as borders and padding, comes from Snacks' `image.doc` configuration.
 
-Same approach Overleaf's editor uses:
+See [config.lua](lua/latex-preview/config.lua) for every option and its
+default, including supported filetypes, daemon startup limits, macro
+extraction, and cache limits.
 
-1. **Find the TeX root** for the current buffer. The plugin checks, in
-   order: a `% !TEX root = ...` magic comment, vimtex root metadata when
-   available, and an unambiguous parent `.tex` file that contains
-   `\begin{document}` and reaches the current file through
-   `\input`/`\include`/`\subfile`. If no root is found, the current
-   buffer is used.
+### Preview size and update delay
 
-2. **Scan the root preamble** for definition-shaped commands:
-   `\newcommand`, `\renewcommand`, `\providecommand`,
-   `\DeclareMathOperator`, `\NewDocumentCommand`, `\def`, `\let`, etc.
-   Anything before `\begin{document}` is included. If the current buffer
-   is a chapter/include file, definitions from that buffer are included
-   too.
-
-3. **Scan local `.sty`/`.tex` macro files** referenced from the root
-   preamble via `\usepackage{name}`, `\RequirePackage{name}`,
-   `\input{name}`, or `\include{name}` when matching local files exist in
-   the root directory or configured parent search depth.
-
-4. **Normalize for MathJax**: `\providecommand` → `\newcommand` (because
-   MathJax's `\providecommand` no-ops on built-in name collisions),
-   `\edef` → `\def` (MathJax doesn't do expand-at-definition).
-
-5. **Send to the daemon** as a preamble. MathJax registers the macros
-   into its macro table, then renders the equation.
-
-This means custom notation packages "just work" without any per-project
-setup.
-
-### Multi-file projects
-
-When editing an included chapter file, latex-preview uses the project's
-actual root preamble instead of only scanning the chapter. The root file
-does not need to be named `main.tex`; it can be `paper.tex`, `thesis.tex`,
-or any other `.tex` file.
-
-The most explicit setup is a magic comment in the chapter:
-
-```tex
-% !TEX root = ../paper.tex
-```
-
-If that is not present, vimtex's root metadata is used when available.
-As a fallback, latex-preview searches parent directories for a single
-`.tex` file that contains `\begin{document}` and reaches the current
-file through `\input{...}`, `\include{...}`, or `\subfile{...}`. Nested
-includes are followed, so a root can include a part file which then
-includes the chapter you are editing.
-
-Preamble extraction is cached by the current buffer, the resolved root
-file, and the local macro files that were scanned, so edits to the
-chapter, root preamble, or referenced local macro files invalidate the
-preview preamble.
-
-## References and citations
-
-Reference previews support common one-argument reference commands:
-`\ref`, `\eqref`, `\autoref`, `\cref`, `\Cref`, `\vref`, and `\Vref`.
-The preview shows the equation that contains the matching `\label`.
-
-Theorem-like reference previews use the same commands and show the labeled
-`theorem`, `lemma`, `proposition`, or `definition` block as source text.
-Inline and display math source inside that text is concealed and replaced
-with MathJax-rendered images, using the same extracted macro preamble as
-equation previews. Common aliases such as `thm`, `lem`, `prop`, and `defn`
-are detected from `\newtheorem` declarations.
-
-Citation previews support citation-style commands whose command name
-contains `cite`, including common BibTeX and biblatex forms such as
-`\cite`, `\citet`, `\citep`, `\parencite`, and `\textcite`. For multiple
-keys, the key under the cursor is used when possible; otherwise the
-first key is shown.
-
-These features are enabled by default and can be toggled at runtime with
-`:LatexPreview refs`, `:LatexPreview thms`, and `:LatexPreview cites`.
-
-## What renders
-
-Anything MathJax supports:
-
-- AMS math (`amsmath`, `amssymb`, `mathtools` features)
-- Custom macros from buffer or `.sty`
-- `\begin{equation}`, `\begin{align}`, `\begin{gather}`, `\begin{multline}`,
-  `\begin{cases}`, `\begin{matrix}` and friends
-- `\bm`, `\boldsymbol`, `\mathbb`, `\mathcal`, `\mathfrak`, etc.
-- `\color`, `\mathcolor`
-- `tikz-cd` (commutative diagrams)
-
-Doesn't render: TikZ in math, runtime-evaluated macros (`\ifthenelse`,
-counters, lengths), and exotic packages that do more than define macros.
-For those, your `pdflatex` compile remains the source of truth.
-
-Reference, theorem, and citation target discovery is a static editor lookup.
-Generated labels, imported bibliography data not listed in the current buffer,
-and advanced bibliography inheritance are not expanded.
-
-## Performance (done by Claude)
-
-| | First render | Subsequent |
-|---|---|---|
-| Daemon boot | ~300–500 ms | 0 |
-| MathJax render | ~10–30 ms | ~10–30 ms |
-| SVG → PNG | ~20–30 ms | ~20–30 ms |
-| Cache hit | n/a | ~1 ms |
-
-Measured on Apple Silicon / Node v25 with rsvg-convert. Older hardware
-or Node versions may be slower (daemon boot up to ~1 s on Node v18).
-
-The daemon stays warm for the whole Neovim session. After the first
-render, hover popups feel instant — the typical case is a cache hit on
-something you've already seen, which returns in ~1 ms.
-
-### Equation scanning (regex fallback)
-
-When treesitter parsers are not available, the plugin falls back to a
-regex scan. Consumed byte ranges are tracked as sorted intervals with
-binary-search overlap detection rather than marking every byte:
-
-| File size | Equations | Scan time |
-|---|---|---|
-| ~10 KB | ~50 inline | ~65 µs |
-| ~40 KB | ~260 inline | ~250 µs |
-| ~150 KB | ~1200 inline | ~900 µs |
-| ~500 KB | ~6000 inline | ~4500 µs |
-
-Sub-millisecond for typical files. The treesitter path has no regex
-overhead at all.
-
-## Troubleshooting
-
-**Custom `\newcommand` not picked up.** Run `:LatexPreview debug` with
-the cursor on the affected equation and inspect the output. If the
-preamble section is empty or missing the macro you defined, the issue
-is in the extractor — likely your definition uses a form the regex
-doesn't recognize, or it appears after `\begin{document}`. If the
-preamble looks correct but the equation still renders without the macro
-applied, the cache may be holding a stale render from before the macro
-existed; run `:LatexPreview clear` and try again.
-
-**`:checkhealth latex-preview` shows errors.** First stop for any install issue.
-
-**The popup doesn't appear.** Check `:LatexPreview status` — does
-"terminal supports graphics" say `true`? If not, you're on a terminal
-without Kitty graphics protocol support. The plugin needs Kitty,
-iTerm2, WezTerm, or Ghostty.
-
-**Specific equation gives "render failed".** Run `:messages` for the
-specific error. MathJax doesn't support every TeX command; switch to
-your normal compile for those.
-
-**Popup is too big or too small.** Adjust `render.density` (higher =
-larger). HiDPI users typically want 600. To change it live for the
-current buffer without editing your config:
+Higher density produces larger previews. You can adjust it for the
+current buffer without changing your configuration:
 
 ```vim
 :LatexPreview density 300
@@ -502,20 +195,179 @@ current buffer without editing your config:
 :LatexPreview display-density reset
 ```
 
-The same buffer-local values can be set from Lua:
+The equivalent buffer variables are `vim.b.latex_preview_density` and
+`vim.b.latex_preview_display_density`.
+
+Live editing waits for `popup.live_update_delay_ms` after text changes.
+Lower the default of 300 ms if you prefer earlier updates. Display math
+uses LaTeX display style. Source line breaks are treated as spaces. Use
+`align`, `aligned`, `gather`, or `multline` for multiple rendered lines.
+
+### Caching and Snacks integration
+
+Renders are reused by content, preamble, and rendering settings. With
+`cache = true`, unmodified buffers write persistent files to `cache_dir`.
+Modified buffers, and all renders with `cache = false`, use reusable
+session files under `stdpath("run")/latex-preview/<pid>/`. These temporary
+files are removed on normal exit.
+
+`cache_dir` accepts `"aux"`, a fixed absolute path, or a function taking a
+buffer number and returning a path. `"aux"` uses
+`<buffer-directory>/aux/latex-preview-cache/`, with a global cache fallback
+for unnamed buffers. `:LatexPreview clear` clears that persistent directory,
+which may be shared by several buffers.
+
+The plugin uses Snacks' image placement backend. By default,
+`snacks.disable_document_images = true` disables Snacks' own document
+image renderer globally to avoid overlapping previews. Set it to `false`
+if you want to keep that renderer active.
+
+The default `snacks.clean_info_on_exit = true` empties the **shared Snacks
+image cache** on exit. Set it to `false` to preserve that cache. Despite
+the option name, it removes images as well as metadata. The settings
+`snacks.max_cache_files = 100`, `snacks.max_cache_bytes = 50 * 1024 * 1024`,
+and `snacks.cache_grace_ms = 5000` also bound Snacks cache groups and
+reusable session renders. They do not limit the persistent project cache.
+Set either limit to `0` to disable that limit.
+
+### Lua API
+
+To manage your own mappings, leave `setup_keymap = false` and call the
+public API:
 
 ```lua
-vim.b.latex_preview_density = 300
-vim.b.latex_preview_display_density = 600
+vim.keymap.set("n", "<leader>m", function()
+  require("latex-preview").toggle()
+end)
+
+-- Other entry points:
+require("latex-preview").hover() -- show, returns false if no target is found
+require("latex-preview").close()
+require("latex-preview").set_auto_hover(true)
 ```
 
-**Daemon respawns repeatedly.** `@mathjax/src@4` not in the search path.
-Set `LATEX_PREVIEW_MATHJAX_PATH` env var to its install directory, or
-`npm install -g @mathjax/src@4` again.
+## Macros and projects
 
-**It's slow on the very first equation.** That's the daemon boot
-(~300–500 ms on modern hardware). Every later equation is fast.
+The plugin extracts common definitions such as `\newcommand`,
+`\renewcommand`, `\providecommand`, `\DeclareMathOperator`,
+`\NewDocumentCommand`, `\def`, and `\let`. It reads definitions before
+`\begin{document}` in the root preamble, plus definitions from the current
+chapter when editing an included file.
+
+The root is resolved in this order:
+
+1. A `% !TEX root = ...` comment in the current file.
+2. Vimtex's root metadata, when available.
+3. An unambiguous parent `.tex` file containing `\begin{document}` that
+   reaches the current file through `\input`, `\include`, or `\subfile`.
+4. The current file if no root is found.
+
+The root can have any filename. For an explicit choice, add this to a
+chapter file:
+
+```tex
+% !TEX root = ../paper.tex
+```
+
+With `extract.scan_sty = true`, local `.sty` and `.tex` files referenced
+from the root preamble through `\usepackage`, `\RequirePackage`, `\input`,
+or `\include` are scanned too. The search checks the root directory and
+up to `extract.sty_search_depth` parent directories, four by default.
+Edits to the buffer, root preamble, or scanned macro files invalidate the
+extraction cache.
+
+Definitions are normalized for MathJax. In particular, `\providecommand`
+is rewritten as `\newcommand`, and `\edef` as `\def`. These are controlled
+by `extract.rewrite_providecommand` and `extract.rewrite_edef`.
+
+### Rendering limits
+
+Previews support MathJax's TeX math features, including common AMS math,
+matrices, aligned equations, font commands, colors, and compatible custom
+macros. This is not a full TeX engine. General TikZ drawings, arbitrary
+LaTeX packages, and macros depending on document state may not render as
+they do in your compiled document. Use your usual LaTeX build to verify
+the final output.
+
+## Performance
+
+Measured on Apple Silicon with Neovim 0.12.5, Node 26.0.0, MathJax 4.1.2,
+`rsvg-convert`, 300 DPI, and padding to 10 × 20 pixel terminal cells:
+
+| Completed PNG, warm daemon | Before optimization | After optimization |
+|---|---:|---:|
+| Inline equation | 46.73 ms | 18.74 ms |
+| Equation using a custom macro | 46.53 ms | 19.22 ms |
+| Display equation | 49.32 ms | 20.35 ms |
+| Cached PNG | 0.03 ms | 0.03 ms |
+
+These are means over 40 different equations per workload and 100 cache
+hits. They include daemon communication, SVG output, rasterization, and
+padding. They exclude target lookup, the typing debounce, and Snacks image
+placement. The first PNG also pays daemon startup, measured at roughly
+0.35 seconds in the updated run. Timings vary with hardware and equations.
+
+The daemon reuses MathJax font data while giving each request a fresh TeX
+parser, so definitions do not leak between buffers. It skips unused SVG
+output when processing the preamble. With `rsvg-convert`, terminal-cell
+padding happens during rasterization, avoiding an extra ImageMagick
+process and PNG decode/encode.
+
+The daemon-only benchmark measured about 0.9–1.2 ms per warm request,
+down from 19–20 ms on the same machine. Rasterization accounts for most
+of the remaining PNG time.
+
+Without Treesitter, an uncached regex scan of 4,000 lines (285 KB,
+2,667 equations) fell from 21.48 ms to 4.80 ms. Unchanged buffers reuse
+parsed results.
+
+Run the benchmarks from the repository root:
+
+```sh
+nvim --headless -u NONE -i NONE -l bench/render_bench.lua
+node tests/daemon_bench.mjs
+nvim --headless -u NONE -i NONE -l bench/parse_extract_bench.lua
+```
+
+## Troubleshooting
+
+**Start with `:checkhealth latex-preview`.** It checks Snacks, terminal
+support, Node.js, MathJax, the rasterizer, and optional Treesitter parsers.
+For image transport issues, also run `:checkhealth snacks`.
+
+**No popup appears.** Check `:LatexPreview status` and confirm that the
+cursor is on a supported target. A false terminal-support result means
+Snacks is not reporting the placeholder support expected by the plugin.
+Check your terminal and multiplexer settings against Snacks' compatibility
+notes linked above.
+
+**A custom macro is missing.** Run `:LatexPreview debug` on the equation
+and inspect the extracted preamble. Definitions after `\begin{document}`
+are not collected. For chapter files, check the resolved root with an
+explicit `% !TEX root` comment. If the definition is present, it may use
+TeX features MathJax does not support. Changes to extracted definitions
+normally invalidate renders automatically.
+
+**An equation reports a render error.** Read `:messages` for the error.
+Try `rsvg-convert` if ImageMagick produces a blank or corrupt image.
+Unsupported TeX commands still need a normal LaTeX build.
+
+**The daemon fails to start or keeps restarting.** Check that
+`@mathjax/src@4` is installed and visible to the Node.js used by Neovim.
+For a nonstandard installation, set `LATEX_PREVIEW_MATHJAX_PATH` to the
+package directory. Run `:LatexPreview stop` before trying again.
+
+**The first preview is slower.** It includes Node.js and MathJax startup.
+Subsequent previews reuse that process. See the measurements above for
+what render timings include.
+
+## Acknowledgements
+
+This project was inspired by Overleaf's preview tooltips. I used Claude
+for the initial implementation and ChatGPT/Codex to help audit and optimize
+it. MathJax provides the math renderer, and snacks.nvim provides terminal
+image placement.
 
 ## License
 
-MIT
+[MIT](LICENSE)

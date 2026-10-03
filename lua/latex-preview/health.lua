@@ -177,7 +177,9 @@ local function check_rasterizer()
         "  apt install imagemagick librsvg2-bin   (Debian/Ubuntu)",
         "  brew install imagemagick librsvg       (macOS)" })
   end
-  if config.options.render.pad_to_cells and not magick then
+  local tool = config.options.render.svg_to_png
+  local uses_rsvg = rsvg and (tool == "auto" or tool == "rsvg")
+  if config.options.render.pad_to_cells and not magick and not uses_rsvg then
     report_warn("render.pad_to_cells is enabled but ImageMagick is not available",
       { "Install ImageMagick (`magick` or `convert`) to pad generated PNGs to terminal-cell boundaries.",
         "Without padding, some terminals may scale short equations slightly." })

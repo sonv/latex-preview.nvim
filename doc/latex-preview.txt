@@ -368,6 +368,9 @@ When you trigger hover:
    MathJax. The daemon parses the preamble (registering macros into its
    macro table), then renders the equation to SVG. The SVG is rasterized
    to PNG via rsvg-convert when available, otherwise ImageMagick.
+   MathJax font data is shared between requests, while each request has
+   its own TeX parser. With rsvg-convert, terminal-cell padding is applied
+   in the SVG so only one rasterizer process is needed.
 
 4. The rendered PNG path is handed to snacks.nvim's
    `Snacks.image.placement.new(buf, png_path, opts)` inside a fresh
@@ -384,6 +387,10 @@ the target \label in the current buffer. Theorem-like references open a text
 popup for the matching source block and render math fragments inside that
 popup. Citation previews open a text popup containing the matching BibTeX
 entry.
+
+Live typing updates wait for popup.live_update_delay_ms (300 ms by default)
+before rendering. This delay is separate from the time needed to produce
+the PNG. Lower it to show updates sooner after typing pauses.
 
 ==============================================================================
 8. LIMITATIONS                                     *latex-preview-limitations*

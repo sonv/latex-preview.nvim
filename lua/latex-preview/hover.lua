@@ -33,10 +33,11 @@ local targets = require("latex-preview.targets")
 ---@field render_id integer
 ---@field signature string
 local current = nil ---@type LatexPreview.HoverState?
-local next_render_id = 0
 local active_render_id = 0
+local pending_render = nil
 local autocmd_buf = nil
 local refresh_timer = nil
+local refresh_generation = 0
 local source_keymaps = {} ---@type table<integer, table<string, table|false>>
 local auto_buffers = {} ---@type table<integer, boolean>
 
@@ -47,6 +48,7 @@ local function auto_group_name(buf)
 end
 
 local function stop_refresh_timer()
+  refresh_generation = refresh_generation + 1
   if not refresh_timer then return end
   refresh_timer:stop()
   refresh_timer:close()
@@ -54,8 +56,13 @@ local function stop_refresh_timer()
 end
 
 local function close_current()
-  if not current then return end
+  -- Closing also cancels the first render and any queued live update, even
+  -- before there is a floating window to close.
+  active_render_id = active_render_id + 1
+  pending_render = nil
+  autocmd_buf = nil
   stop_refresh_timer()
+  if not current then return end
   if current.img then pcall(function() current.img:close() end) end
   for _, img in ipairs(current.imgs or {}) do
     pcall(function() img:close() end)
@@ -86,9 +93,11 @@ local function close_current()
     end
     source_keymaps[buf] = nil
   end
-  active_render_id = active_render_id + 1
-  autocmd_buf = nil
   current = nil
+end
+
+local function has_preview(buf)
+  return (current and current.buf == buf) or (pending_render and pending_render.buf == buf)
 end
 
 local function map_close_keys(win, source_buf)
@@ -188,6 +197,24 @@ local function render_density(buf, display)
   return config.options.render.density
 end
 
+local function render_output_signature(pad)
+  local tool = config.options.render.svg_to_png
+  if tool == "auto" then
+    tool = vim.fn.executable("rsvg-convert") == 1 and "rsvg" or "magick"
+  end
+  local width, height
+  if pad then
+    local ok, snacks = pcall(require, "snacks")
+    local terminal = ok and snacks.image and snacks.image.terminal
+    local cells = terminal and terminal.size and terminal.size()
+    if cells then
+      width, height = tonumber(cells.cell_width), tonumber(cells.cell_height)
+      if not width or not height or width <= 0 or height <= 0 then width, height = nil, nil end
+    end
+  end
+  return table.concat({ tostring(tool), tostring(width or ""), tostring(height or "") }, ":")
+end
+
 local function render_signature(preamble, eq, buf)
   local font_size = eq.display
     and (config.options.render.display_font_size or config.options.render.font_size)
@@ -201,6 +228,22 @@ local function render_signature(preamble, eq, buf)
     tostring(config.options.render.display_math_style),
     tostring(config.options.render.pad_to_cells),
     tostring(render_density(buf, eq.display)),
+    render_output_signature(config.options.render.pad_to_cells == true),
+  }, "\n--latex-preview--\n")
+end
+
+local function mixed_render_signature(preamble, target, buf)
+  return table.concat({
+    target.signature or table.concat(target.lines or {}, "\n"),
+    vim.fn.sha256(preamble),
+    tostring(render_density(buf, false)),
+    tostring(render_density(buf, true)),
+    tostring(config.options.render.font_size),
+    tostring(config.options.render.display_font_size),
+    tostring(config.options.render.display_math_style),
+    tostring(config.options.render.pad_to_cells),
+    config.get_fg(),
+    render_output_signature(config.options.render.pad_to_cells == true),
   }, "\n--latex-preview--\n")
 end
 
@@ -245,8 +288,11 @@ local function schedule_open(buf)
     refresh_timer = assert((vim.uv or vim.loop).new_timer())
   end
   local delay = (config.options.popup or {}).live_update_delay_ms or 300
+  refresh_generation = refresh_generation + 1
+  local generation = refresh_generation
   refresh_timer:start(delay, 0, function()
     vim.schedule(function()
+      if generation ~= refresh_generation then return end
       if vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_get_current_buf() == buf then
         M.open()
       end
@@ -255,7 +301,7 @@ local function schedule_open(buf)
 end
 
 local function schedule_current_open(buf)
-  if not current then return true end
+  if not has_preview(buf) then return true end
   schedule_open(buf)
 end
 
@@ -267,7 +313,7 @@ local function register_autocmds(buf)
     group = group,
     buffer = buf,
     callback = function()
-      if current and current.buf == buf then close_current() end
+      if has_preview(buf) then close_current() end
       return true
     end,
   })
@@ -279,7 +325,7 @@ local function register_autocmds(buf)
     group = group,
     buffer = buf,
     callback = function()
-      if not current then
+      if not has_preview(buf) then
         autocmd_buf = nil
         return true
       end
@@ -306,9 +352,9 @@ local function register_autocmds(buf)
     group = group,
     buffer = buf,
     callback = function()
-      if not current then return true end
+      if not has_preview(buf) then return true end
       vim.schedule(function()
-        if current then M.open() end
+        if has_preview(buf) and vim.api.nvim_get_current_buf() == buf then M.open() end
       end)
     end,
   })
@@ -320,6 +366,10 @@ end
 function M.attach(buf)
   if auto_buffers[buf] then return end
   auto_buffers[buf] = true
+  if has_preview(buf) then
+    autocmd_buf = nil
+    register_autocmds(buf)
+  end
   local group = vim.api.nvim_create_augroup(auto_group_name(buf), { clear = true })
 
   vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI" }, {
@@ -344,7 +394,7 @@ function M.attach(buf)
     buffer = buf,
     callback = function()
       vim.schedule(function()
-        if vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_get_current_buf() == buf then
+        if auto_buffers[buf] and vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_get_current_buf() == buf then
           M.open()
         end
       end)
@@ -355,7 +405,7 @@ function M.attach(buf)
     group = group,
     buffer = buf,
     callback = function()
-      if current and current.buf == buf then close_current() end
+      if has_preview(buf) then close_current() end
     end,
   })
 
@@ -364,13 +414,13 @@ function M.attach(buf)
     buffer = buf,
     callback = function()
       auto_buffers[buf] = nil
-      if current and current.buf == buf then close_current() end
+      if has_preview(buf) then close_current() end
       return true
     end,
   })
 
   vim.schedule(function()
-    if vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_get_current_buf() == buf then
+    if auto_buffers[buf] and vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_get_current_buf() == buf then
       M.open()
     end
   end)
@@ -382,7 +432,7 @@ function M.detach(buf)
   if not auto_buffers[buf] then return end
   auto_buffers[buf] = nil
   pcall(vim.api.nvim_del_augroup_by_name, auto_group_name(buf))
-  if current and current.buf == buf then close_current() end
+  if has_preview(buf) then close_current() else stop_refresh_timer() end
 end
 
 ---Stop automatically opening/updating previews in every attached buffer.
@@ -550,11 +600,15 @@ local function render_math_in_text_window(source_buf, source_win, target, win, r
   if #eqs == 0 then return end
   local snacks = require("snacks")
   local preamble = extract.get_preamble(source_buf)
-  local preamble_hash = vim.fn.sha256(preamble)
+  local signature = mixed_render_signature(preamble, target, source_buf)
   local popup = config.options.popup or {}
   local max_width = popup.max_width or math.max(1, vim.o.columns - 4)
   local max_height = popup.max_height or math.max(1, vim.o.lines - 4)
   for i, eq in ipairs(eqs) do
+    -- Inline math must fit the surrounding text; display math inherits the
+    -- configured cell padding. Lua's and/or idiom cannot preserve false/nil.
+    local pad_to_cells
+    if not eq.display then pad_to_cells = false end
     render.render({
       preamble = preamble,
       equation = eq.text,
@@ -563,7 +617,7 @@ local function render_math_in_text_window(source_buf, source_win, target, win, r
       live = true,
       live_id = render_id * 1000 + i,
       font_size = not eq.display and math.max(config.options.render.font_size or 11, 12) or nil,
-      pad_to_cells = eq.display and nil or false,
+      pad_to_cells = pad_to_cells,
     }, function(err, png_path)
       -- Live renders are reusable temp-cache entries owned by render.lua's
       -- per-process temp directory. Unused images are left in place so a
@@ -580,7 +634,9 @@ local function render_math_in_text_window(source_buf, source_win, target, win, r
       end)
       if not ok_target then return cleanup_unused() end
       if not live_target or live_target.signature ~= target.signature then return cleanup_unused() end
-      if vim.fn.sha256(extract.get_preamble(source_buf)) ~= preamble_hash then return cleanup_unused() end
+      if mixed_render_signature(extract.get_preamble(source_buf), live_target, source_buf) ~= signature then
+        return cleanup_unused()
+      end
 
       local placement_opts = snacks.config.merge({}, snacks.image.config.doc, {
         inline = true,
@@ -606,16 +662,7 @@ end
 
 local function show_mixed_text_target(buf, source_win, target)
   local preamble = extract.get_preamble(buf)
-  local signature = table.concat({
-    target.signature or table.concat(target.lines or {}, "\n"),
-    vim.fn.sha256(preamble),
-    tostring(render_density(buf, false)),
-    tostring(render_density(buf, true)),
-    tostring(config.options.render.font_size),
-    tostring(config.options.render.display_font_size),
-    tostring(config.options.render.display_math_style),
-    tostring(config.options.render.pad_to_cells),
-  }, "\n--latex-preview--\n")
+  local signature = mixed_render_signature(preamble, target, buf)
   if current and current.type == "mixed_text" and current.signature == signature then
     current.buf = buf
     current.source_win = source_win
@@ -713,7 +760,7 @@ function M.open()
     snacks.image.config.doc.inline = false
   end
   -- Build the request and render. The result is a PNG path (from disk
-  -- cache on a hit, ~10-50 ms via the daemon on a miss).
+  -- cache on a hit, via the daemon and rasterizer on a miss).
   local preamble = extract.get_preamble(buf)
   local req = {
     preamble = preamble,
@@ -723,21 +770,35 @@ function M.open()
     live = true,
   }
   local signature = render_signature(preamble, eq, buf)
+  if current and not current.img then close_current() end
   if current and current.img and current.signature == signature then
+    if pending_render then
+      active_render_id = active_render_id + 1
+      pending_render = nil
+    end
     current.eq = eq
+    current.buf = buf
+    current.source_win = source_win
     show_under_cursor(current.win, source_win)
     pcall(function() current.img:update() end)
+    map_close_keys(current.win, buf)
+    register_autocmds(buf)
     return true
   end
-  next_render_id = next_render_id + 1
-  local render_id = next_render_id
-  active_render_id = render_id
+  if pending_render and pending_render.signature == signature
+      and pending_render.buf == buf and pending_render.source_win == source_win then
+    return true
+  end
+  active_render_id = active_render_id + 1
+  local render_id = active_render_id
+  pending_render = { buf = buf, source_win = source_win, signature = signature }
   req.live_id = render_id
   if current then
     current.render_id = render_id
     current.source_win = source_win
     show_under_cursor(current.win, source_win)
   end
+  register_autocmds(buf)
 
   render.render(req, function(err, png_path)
     -- Live renders write reusable temp-cache files in
@@ -745,6 +806,7 @@ function M.open()
     -- files in place so later identical renders can reuse them.
     local function cleanup_unused() end
     if active_render_id ~= render_id then return cleanup_unused() end
+    pending_render = nil
     if current and current.render_id ~= render_id then return cleanup_unused() end
     if not vim.api.nvim_buf_is_valid(buf) or not vim.api.nvim_win_is_valid(source_win) then return cleanup_unused() end
     if vim.api.nvim_get_current_buf() ~= buf or vim.api.nvim_get_current_win() ~= source_win then return cleanup_unused() end

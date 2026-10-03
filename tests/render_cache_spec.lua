@@ -155,6 +155,7 @@ out=""
 for arg do
   out="$arg"
 done
+out="${out#PNG:}"
 printf 'png' > "$out"
 ]])
 uv.fs_chmod(fake_bin .. "/magick", 493)

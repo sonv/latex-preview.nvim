@@ -104,10 +104,12 @@ local function command_under_cursor(buf, is_wanted)
     if not slash then return nil end
     if not util.is_escaped(line, slash) then
       local cmd = parse_command(line, slash)
-      if cmd and is_wanted(strip_star(cmd.cmd)) and col >= cmd.start_col and col <= cmd.end_col then
+      if cmd and is_wanted(strip_star(cmd.cmd)) and col >= cmd.start_col and col < cmd.end_col then
         return cmd, row, col
       end
-      pos = (cmd and cmd.end_col + 2) or (slash + 1)
+      -- Keep searching inside formatting commands such as \emph{\ref{...}},
+      -- and include the byte immediately after a command's closing brace.
+      pos = slash + 1
     else
       pos = slash + 1
     end
