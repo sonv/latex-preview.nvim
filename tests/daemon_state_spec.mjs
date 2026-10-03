@@ -87,11 +87,48 @@ y
   assert.equal(drawing(await render(String.raw`\foo+\barvalue`, { preamble })), drawing(await render("x+y+z")));
 });
 
+test("preamble fallback keeps all arguments of multiline declarations", async () => {
+  const preamble = String.raw`\unsupported
+\let\originaldef\def
+\newcommand{\foo}
+  [1][{y}]
+  {#1+x}
+\newcommand\barvalue
+  {z}
+\newenvironment{localenv}
+  {\left(}
+  {\right)}
+\DeclareMathOperator*{\argmax}
+  {arg\,max}`;
+  assert.equal(drawing(await render(String.raw`\begin{localenv}\foo+\barvalue\end{localenv}`, { preamble })),
+    drawing(await render(String.raw`\left({y}+x+z\right)`)));
+  const operator = await render(String.raw`\argmax_{n}x`, { preamble, display: true });
+  assert(operator.includes('data-mml-node="munder"'), "starred operator lost display limits");
+  assert.equal(drawing(operator), drawing(await render(String.raw`\operatorname*{arg\,max}_{n}x`, { display: true })));
+});
+
 test("preamble fallback starts before partially applied macro redefinitions", async () => {
   const preamble = String.raw`\let\originalsin\sin
 \def\sin{x}
 \unsupported`;
   assert.equal(drawing(await render(String.raw`\originalsin y`, { preamble })), drawing(await render(String.raw`\sin y`)));
+});
+
+test("preamble fallback keeps multiline declarations after let on the same line", async () => {
+  for (const assignment of [String.raw`\let\originalsin\sin`, String.raw`\let\originaldef=\def`]) {
+    const preamble = String.raw`\unsupported
+${assignment} \newcommand{\reviewmacro}{
+x+y
+}`;
+    assert.equal(drawing(await render(String.raw`\reviewmacro`, { preamble })), drawing(await render("x+y")));
+  }
+});
+
+test("preamble fallback recovers after an unfinished declaration", async () => {
+  const preamble = String.raw`\unsupported
+\newcommand{\unfinished}
+\newcommand{\reviewmacro}{x}`;
+  assert.equal(drawing(await render(String.raw`\reviewmacro`, { preamble })), drawing(await render("x")));
 });
 
 test("multiline display comments retain their line endings", async () => {

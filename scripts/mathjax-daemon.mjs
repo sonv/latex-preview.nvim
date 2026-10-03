@@ -250,23 +250,85 @@ function splitPreambleBlocks(preamble) {
   const blocks = [];
   let block = [];
   let depth = 0;
-  let started = false;
+  let state = null;
 
-  const update = (line) => {
+  // A balanced name argument is only the start of a declaration. Keep its
+  // replacement text (and an environment's end code) in the same retry.
+  const definitions = {
+    newcommand: [2, true], renewcommand: [2, true], providecommand: [2, true],
+    DeclareRobustCommand: [2, true], DeclareMathOperator: [2, true],
+    NewDocumentCommand: [3, true], RenewDocumentCommand: [3, true], ProvideDocumentCommand: [3, true],
+    newenvironment: [3], renewenvironment: [3], newtheorem: [2],
+    def: [1], gdef: [1], edef: [1], let: [0, false, 2], newcounter: [1],
+  };
+  const nextDefinition = (line, from = 0) => {
+    const commands = /\\([A-Za-z@]+)/g;
+    commands.lastIndex = from;
+    for (let match; (match = commands.exec(line));) {
+      let slashes = 0;
+      for (let i = match.index - 1; i >= 0 && line[i] === "\\"; i--) slashes++;
+      const spec = definitions[match[1]];
+      if (slashes % 2 || !Object.hasOwn(definitions, match[1])) continue;
+      return { groups: spec[0], macro: spec[1], tokens: spec[2], depth: 0, optional: false,
+        pos: commands.lastIndex, start: match.index };
+    }
+    return null;
+  };
+
+  const uncomment = (line) => {
     for (let i = 0; i < line.length; i++) {
-      const c = line[i];
-      if (c === "\\") {
-        i++;
-      } else if (c === "%") {
-        return line.slice(0, i);
-      } else if (c === "{") {
-        depth++;
-        started = true;
-      } else if (c === "}") {
-        depth--;
-      }
+      if (line[i] === "\\") i++;
+      else if (line[i] === "%") return line.slice(0, i);
     }
     return line;
+  };
+
+  const update = (line, from = 0) => {
+    let i = from;
+    while (state) {
+      if (state.groups === 0 && !state.tokens) {
+        state = nextDefinition(line, i);
+        if (!state) return;
+        i = state.pos;
+      }
+      if (i >= line.length) return;
+      const c = line[i];
+      // A \let source may itself be named \def or \newcommand. Consume
+      // its two tokens, then allow a declaration to follow on this line.
+      if (state.tokens) {
+        if (/\s/.test(c)) i++;
+        else if (c === "=" && state.tokens === 1 && !state.equals) {
+          state.equals = true;
+          i++;
+        } else {
+          const control = /^\\(?:[A-Za-z@]+|.)/.exec(line.slice(i));
+          i += control ? control[0].length : 1;
+          state.tokens--;
+        }
+        continue;
+      }
+      if (state.macro && !/[\s*]/.test(c)) {
+        state.macro = false;
+        if (c === "\\") {
+          const control = /^\\(?:[A-Za-z@]+|.)/.exec(line.slice(i));
+          i += control ? control[0].length : 1;
+          state.groups--;
+          continue;
+        }
+      }
+      if (c === "\\") i += 2;
+      else {
+        if (c === "{") state.depth++;
+        else if (c === "}") {
+          state.depth = Math.max(0, state.depth - 1);
+          if (state.depth === 0 && !state.optional) state.groups--;
+        } else if (state.depth === 0) {
+          if (c === "[") state.optional = true;
+          else if (c === "]") state.optional = false;
+        }
+        i++;
+      }
+    }
   };
 
   const flush = () => {
@@ -274,23 +336,39 @@ function splitPreambleBlocks(preamble) {
     if (text) blocks.push(text);
     block = [];
     depth = 0;
-    started = false;
+    state = null;
   };
 
   for (const raw of preamble.split(/\r?\n/)) {
-    const line = raw.trim();
-    if (!line || line.startsWith("%")) {
+    // MathJax's argument scanner counts braces inside comments. Remove the
+    // comment before replaying a block, while respecting escaped percent signs.
+    const line = uncomment(raw);
+    if (!line.trim()) {
       // A comment or empty line inside a macro body cannot end the definition.
       if (block.length) block.push("");
       continue;
     }
-    // MathJax's argument scanner counts braces inside comments. Remove the
-    // comment before replaying a block, while respecting escaped percent signs.
-    block.push(update(raw));
-    if (started && depth <= 0) flush();
-    // Unsupported control lines such as \makeatletter must not consume the
-    // following valid definition when the full-preamble parse has failed.
-    else if (!started && !/^\\(?:newcommand|renewcommand|providecommand|DeclareMathOperator|def|gdef|edef|newenvironment|renewenvironment)\b/.test(line)) flush();
+    const next = nextDefinition(line);
+    // An unfinished declaration must not consume a later independent one.
+    if (state && !state.tokens && state.depth === 0 && !state.optional
+        && next && !line.slice(0, next.start).trim()) flush();
+    const firstLine = block.length === 0;
+    if (firstLine) state = next;
+    block.push(line);
+    if (state) {
+      update(line, firstLine ? state.pos : 0);
+      if (!state) flush();
+    } else {
+      // Unsupported control lines such as \makeatletter must not consume
+      // following definitions. Retain balanced multi-line arguments for
+      // other supported commands, e.g. \definecolor.
+      for (let i = 0; i < line.length; i++) {
+        if (line[i] === "\\") i++;
+        else if (line[i] === "{") depth++;
+        else if (line[i] === "}") depth--;
+      }
+      if (depth <= 0) flush();
+    }
   }
   if (block.length) flush();
   return blocks;

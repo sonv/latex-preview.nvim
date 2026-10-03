@@ -26,6 +26,7 @@ local targets = require("latex-preview.targets")
 ---@field win snacks.win
 ---@field img snacks.image.Placement?
 ---@field imgs snacks.image.Placement[]?
+---@field image_paths string[]?  -- retained render files used by placements
 ---@field buf integer  -- the source buffer (where the cursor was)
 ---@field source_win integer
 ---@field eq LatexPreview.Equation  -- the equation that triggered the popup,
@@ -68,6 +69,7 @@ local function close_current()
     pcall(function() img:close() end)
   end
   pcall(function() current.win:close() end)
+  for _, path in ipairs(current.image_paths or {}) do render.release(path) end
   for buf, maps in pairs(source_keymaps) do
     if vim.api.nvim_buf_is_valid(buf) then
       for _, lhs in ipairs(CLOSE_KEYS) do
@@ -98,6 +100,12 @@ end
 
 local function has_preview(buf)
   return (current and current.buf == buf) or (pending_render and pending_render.buf == buf)
+end
+
+local function retain_image(path)
+  render.retain(path)
+  current.image_paths = current.image_paths or {}
+  current.image_paths[#current.image_paths + 1] = path
 end
 
 local function map_close_keys(win, source_buf)
@@ -573,6 +581,7 @@ local function show_image_file(buf, source_win, png_path, opts)
     signature = opts.signature,
     img = snacks.image.placement.new(win.buf, png_path, placement_opts),
   }
+  retain_image(png_path)
   register_autocmds(buf)
   return true
 end
@@ -655,6 +664,7 @@ local function render_math_in_text_window(source_buf, source_win, target, win, r
       local img = snacks.image.placement.new(win.buf, png_path, placement_opts)
       current.imgs = current.imgs or {}
       current.imgs[#current.imgs + 1] = img
+      retain_image(png_path)
       adjust_mixed_window(win, #(target.lines or {}))
     end)
   end
@@ -879,6 +889,7 @@ function M.open()
       signature = signature,
       img = snacks.image.placement.new(win.buf, png_path, placement_opts),
     }
+    retain_image(png_path)
     register_autocmds(buf)
   end)
 
@@ -893,6 +904,11 @@ end
 ---True when a hover popup is visible.
 function M.is_open()
   return current ~= nil
+end
+
+---True when a hover is visible or its first render is still pending.
+function M.is_active()
+  return current ~= nil or pending_render ~= nil
 end
 
 return M

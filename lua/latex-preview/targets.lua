@@ -37,13 +37,36 @@ local function strip_star(cmd)
   return cmd:gsub("%*$", "")
 end
 
+local function loaded_buffer(path)
+  path = vim.fs.normalize(vim.fn.fnamemodify(path, ":p"))
+  for _, buf in ipairs(vim.api.nvim_list_bufs()) do
+    if vim.api.nvim_buf_is_loaded(buf) then
+      local name = vim.api.nvim_buf_get_name(buf)
+      if name ~= "" and vim.fs.normalize(vim.fn.fnamemodify(name, ":p")) == path then
+        return buf
+      end
+    end
+  end
+end
+
 local function read_lines(path)
+  local buf = loaded_buffer(path)
+  if buf then return vim.api.nvim_buf_get_lines(buf, 0, -1, false) end
   local fd = io.open(path, "r")
   if not fd then return nil end
   local lines = {}
   for line in fd:lines() do lines[#lines + 1] = line end
   fd:close()
   return lines
+end
+
+-- Percent starts a comment in TeX source, but remains ordinary prose in
+-- Markdown. Keep the prefix unchanged so command columns stay accurate.
+local function source_line(buf, line)
+  local ft = vim.bo[buf].filetype
+  if ft ~= "tex" and ft ~= "latex" and ft ~= "plaintex" then return line end
+  local comment = util.tex_comment_start(line)
+  return comment and line:sub(1, comment - 1) or line
 end
 
 local function current_line_cursor()
@@ -98,6 +121,7 @@ local function command_under_cursor(buf, is_wanted)
   local row, col = current_line_cursor()
   local line = vim.api.nvim_buf_get_lines(buf, row, row + 1, false)[1]
   if not line then return nil end
+  line = source_line(buf, line)
   local pos = 1
   while true do
     local slash = line:find("\\", pos, true)
@@ -139,10 +163,11 @@ local function equation_source(buf, eq)
   local lines = vim.api.nvim_buf_get_lines(buf, eq.start_row, eq.end_row + 1, false)
   if #lines == 0 then return "" end
   if #lines == 1 then
-    return lines[1]:sub(eq.start_col + 1, eq.end_col)
+    return source_line(buf, lines[1]):sub(eq.start_col + 1, eq.end_col)
   end
   lines[1] = lines[1]:sub(eq.start_col + 1)
   lines[#lines] = lines[#lines]:sub(1, eq.end_col)
+  for i, line in ipairs(lines) do lines[i] = source_line(buf, line) end
   return table.concat(lines, "\n")
 end
 
@@ -216,6 +241,7 @@ function M.theorem_reference_under_cursor(buf)
   local label = reference_label_under_cursor(buf)
   if not label then return nil end
   local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
+  for i, line in ipairs(lines) do lines[i] = source_line(buf, line) end
   local label_pat = "\\label%s*{%s*" .. vim.pesc(label) .. "%s*}"
   local theorem_envs = theorem_envs_from_preamble(lines)
   local stack = {}
@@ -297,7 +323,10 @@ local function resolve_bib_path(base, name)
     candidates[#candidates + 1] = vim.fn.getcwd() .. "/" .. name
   end
   for _, path in ipairs(candidates) do
-    if uv.fs_stat(path) then return path end
+    local stat = uv.fs_stat(path)
+    if (stat and stat.type == "file") or loaded_buffer(path) then
+      return vim.fs.normalize(vim.fn.fnamemodify(path, ":p"))
+    end
   end
   return nil
 end
@@ -307,7 +336,7 @@ local function bib_files(buf)
   local base = name ~= "" and vim.fs.dirname(vim.fn.fnamemodify(name, ":p")) or vim.fn.getcwd()
   local found, seen = {}, {}
   for _, line in ipairs(vim.api.nvim_buf_get_lines(buf, 0, -1, false)) do
-    for _, bib in ipairs(bib_names_from_line(line)) do
+    for _, bib in ipairs(bib_names_from_line(source_line(buf, line))) do
       local path = resolve_bib_path(base, bib)
       if path and not seen[path] then
         seen[path] = true
@@ -318,19 +347,46 @@ local function bib_files(buf)
   return found
 end
 
+local function bib_entry_end(text, open)
+  local open_char = text:sub(open, open)
+  local braces = open_char == "{" and 1 or 0
+  local quoted = false
+  for i = open + 1, #text do
+    local c = text:sub(i, i)
+    if not util.is_escaped(text, i) then
+      if c == "{" then
+        braces = braces + 1
+      elseif c == "}" and braces > 0 then
+        braces = braces - 1
+        if braces == 0 and open_char == "{" then return i end
+      elseif c == '"' and braces == 0 then
+        quoted = not quoted
+      elseif c == ")" and braces == 0 and not quoted then
+        return i
+      end
+    end
+  end
+end
+
 local function find_bib_entry(path, key)
   local lines = read_lines(path)
   if not lines then return nil end
   local text = table.concat(lines, "\n")
-  local start = text:find("@[%a]+%s*[%({]%s*" .. vim.pesc(key) .. "%s*,")
-  if not start then return nil end
-  local open = text:find("[%({]", start)
-  if not open then return nil end
-  local open_char = text:sub(open, open)
-  local close_char = open_char == "{" and "}" or ")"
-  local close = matching_delim(text, open, open_char, close_char)
-  if not close then return nil end
-  return text:sub(start, close)
+  local pos = 1
+  while true do
+    local start, open, kind = text:find("@([%a]+)%s*[%({]", pos)
+    if not start then return nil end
+    local close = bib_entry_end(text, open)
+    if not close then return nil end
+    kind = kind:lower()
+    -- Iterate complete records. Searching for a key globally also matches
+    -- examples inside field values and entries inside @comment blocks.
+    local entry_key = text:sub(open + 1, close - 1):match("^%s*([^,%s]+)%s*,")
+    if kind ~= "comment" and kind ~= "preamble" and kind ~= "string" and entry_key == key then
+      return text:sub(start, close)
+    end
+    pos = close + 1
+  end
 end
 
 local function is_cite_command(name)

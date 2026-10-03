@@ -131,6 +131,21 @@ processes[4].exit(1, 0)
 flush()
 eq(nil, daemon._state().restart_timer, "shutdown from a rejected callback must cancel automatic restart")
 
+-- Shutdown callbacks can submit a retry; that retry must not undo the stop.
+local shutdown_retry
+daemon.render({ equation = "stopping" }, function(err)
+  assert(err)
+  daemon.render({ equation = "retry during shutdown" }, function(retry_err)
+    shutdown_retry = retry_err
+  end)
+end)
+local before_shutdown = #processes
+daemon.shutdown()
+flush()
+eq(before_shutdown, #processes, "a shutdown callback must not start another daemon")
+eq(nil, daemon._state().handle, "shutdown must leave no running daemon")
+assert(shutdown_retry, "a request made during shutdown must be rejected")
+
 vim.uv, vim.schedule, vim.defer_fn, vim.notify = real_uv, real_schedule, real_defer, real_notify
 print("daemon lifecycle regressions passed")
 vim.cmd("qa!")

@@ -18,6 +18,7 @@ local pad_warning_shown = false
 local temp_cleanup_registered = false
 local temp_cache_timer = nil
 local pending = {}
+local retained = {}
 local schedule_temp_cache_limit_check
 
 local function temp_base_dir()
@@ -129,7 +130,11 @@ local function trim_temp_cache(max_files, max_bytes, grace_ms)
   local next_retry_ms = nil
   for key, group in pairs(groups) do
     local age_ms = (now_sec - group.mtime) * 1000
-    if pending[temp_dir() .. "/" .. key .. ".png"] then
+    local png_path = temp_dir() .. "/" .. key .. ".png"
+    if retained[png_path] then
+      -- Active placements may exceed the configured limit. Recheck when
+      -- the last placement releases its image rather than polling it.
+    elseif pending[png_path] then
       next_retry_ms = 250
     elseif age_ms >= grace_ms then
       entries[#entries + 1] = group
@@ -245,7 +250,7 @@ end
 ---@param req { preamble: string, equation: string, display: boolean, pad_to_cells: boolean? }
 ---@return string  cache key suitable for use as a filename stem
 local function cache_key(req, settings)
-  local renderer_version = "raster-v10-mathjax4"
+  local renderer_version = "raster-v11-mathjax4"
   -- Avoid \0 separators because vim.fn.sha256 treats embedded NULs as a
   -- Blob signal and refuses string input. Newlines are safe and the
   -- collision risk is negligible for our use.
@@ -452,6 +457,18 @@ local function pad_svg(svg, settings)
 end
 
 -- Public API ----------------------------------------------------------------
+
+---Keep a displayed image alive until its placement is closed.
+function M.retain(path)
+  retained[path] = (retained[path] or 0) + 1
+end
+
+function M.release(path)
+  local count = retained[path]
+  if not count then return end
+  retained[path] = count > 1 and (count - 1) or nil
+  if not retained[path] then schedule_temp_cache_limit_check() end
+end
 
 ---Render an equation to a PNG. If already cached, calls cb
 ---with the cached path on the next tick. Otherwise dispatches to the

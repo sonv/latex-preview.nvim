@@ -22,6 +22,13 @@ Rolling changes are listed newest first by date.
 
 ### Fixed
 
+- Preserve multiline macro and environment arguments, including fallback preamble parsing, and retain starred math operators' limit placement.
+- Recheck missing macro dependencies when files are created and resolve nested macro inputs relative to their source files.
+- Respect escaped math delimiters, preserve literal trailing dollar signs, and ignore commented TeX math and Markdown code examples during fallback scanning.
+- Ignore commented references, labels, theorem boundaries, and bibliography declarations. Read unsaved bibliography buffers and keep parentheses or entry-like text inside BibTeX fields from truncating or replacing citation previews.
+- Let toggles cancel a pending first preview, refresh after density resets, and reject density values that round to zero or are not finite.
+- Prevent callbacks from immediately restarting a daemon during shutdown, and keep displayed session images alive until their preview closes.
+- Invalidate older rendered images after the parsing fixes.
 - Keep MathJax's built-in double-struck `\mathbb` by excluding the incompatible `bboldx` extension from global loading.
 - Prevent incomplete package/input arguments from hanging preamble extraction. Use unsaved local macro-file contents and invalidate cached root discovery when its dependencies change.
 - Cancel pending previews and delayed updates on close, buffer leave, or automatic-hover disable. Ignore callbacks from stopped daemon processes after a replacement starts.

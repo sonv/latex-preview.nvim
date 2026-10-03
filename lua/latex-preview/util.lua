@@ -20,6 +20,36 @@ function M.is_escaped(str, idx)
   return count % 2 == 1
 end
 
+---Return the first TeX comment marker, skipping escaped characters and valid
+---single-line \verb/\verb* spans, whose contents treat percent literally.
+---@param line string
+---@return integer?
+function M.tex_comment_start(line)
+  local pos = 1
+  while pos <= #line do
+    local first = line:find("[\\%%]", pos)
+    if not first then return nil end
+    if line:sub(first, first) == "%" then return first end
+
+    local closing
+    if line:sub(first, first + 4) == "\\verb" then
+      local delimiter_pos = first + 5
+      local starred = line:sub(delimiter_pos, delimiter_pos) == "*"
+      if starred then delimiter_pos = delimiter_pos + 1 end
+      local delimiter = line:sub(delimiter_pos, delimiter_pos)
+      -- Without a star, a letter continues the control sequence name
+      -- (e.g. \verbose) and therefore cannot delimit a \verb command.
+      if delimiter ~= "" and not delimiter:match("%s") and (starred or not delimiter:match("%a")) then
+        closing = line:find(delimiter, delimiter_pos + 1, true)
+      end
+    end
+    -- Otherwise skip the escaped character after this backslash. Visiting
+    -- backslash pairs once also handles odd/even escape parity in linear time.
+    pos = closing and (closing + 1) or (first + 2)
+  end
+  return nil
+end
+
 ---Return true if the given treesitter language parser is available.
 ---`parsers` is the result of `require("nvim-treesitter.parsers")`.
 ---@param parsers table

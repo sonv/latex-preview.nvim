@@ -46,35 +46,42 @@ local function buffer_for_path(path)
   return nil
 end
 
--- Patterns that mark a line as carrying a macro/environment definition.
-local DEF_PATTERNS = {
-  "\\newcommand%s*[%*]?%s*[{\\]",
-  "\\renewcommand%s*[%*]?%s*[{\\]",
-  "\\providecommand%s*[%*]?%s*[{\\]",
-  "\\DeclareRobustCommand%s*[%*]?%s*[{\\]",
-  "\\DeclareMathOperator%s*[%*]?%s*{",
-  "\\DeclarePairedDelimiter%s*{",
-  "\\DeclarePairedDelimiterX%s*{",
-  "\\newdelim%s*[{\\]",
-  "\\newdelimX%s*\\",
-  "\\NewDocumentCommand%s*[{\\]",
-  "\\RenewDocumentCommand%s*[{\\]",
-  "\\ProvideDocumentCommand%s*[{\\]",
-  "\\newenvironment%s*[%*]?%s*{",
-  "\\renewenvironment%s*[%*]?%s*{",
-  "\\newtheorem%s*[%*]?%s*{",
-  "\\def%s*\\",
-  "\\gdef%s*\\",
-  "\\edef%s*\\",
-  "\\let%s*\\",
-  "\\newcounter%s*{",
+-- Required braced arguments, including the name. Commands marked `macro`
+-- also accept an unbraced control sequence as their first argument.
+local DEF_COMMANDS = {
+  newcommand = { groups = 2, macro = true },
+  renewcommand = { groups = 2, macro = true },
+  providecommand = { groups = 2, macro = true },
+  DeclareRobustCommand = { groups = 2, macro = true },
+  DeclareMathOperator = { groups = 2, macro = true },
+  DeclarePairedDelimiter = { groups = 3, macro = true },
+  DeclarePairedDelimiterX = { groups = 4, macro = true },
+  newdelim = { groups = 3, macro = true },
+  newdelimX = { groups = 4, macro = true },
+  NewDocumentCommand = { groups = 3, macro = true },
+  RenewDocumentCommand = { groups = 3, macro = true },
+  ProvideDocumentCommand = { groups = 3, macro = true },
+  newenvironment = { groups = 3 },
+  renewenvironment = { groups = 3 },
+  newtheorem = { groups = 2 },
+  def = { groups = 1 },
+  gdef = { groups = 1 },
+  edef = { groups = 1 },
+  let = { groups = 0, tokens = 2 },
+  newcounter = { groups = 1 },
 }
 
-local function is_def_line(line)
-  for _, p in ipairs(DEF_PATTERNS) do
-    if line:find(p) then return true end
+local function next_definition(line, from)
+  local pos = from or 1
+  while true do
+    local s, e, name = line:find("\\([%a@]+)", pos)
+    if not s then return nil end
+    if not util.is_escaped(line, s) and DEF_COMMANDS[name] then
+      local spec = DEF_COMMANDS[name]
+      return { groups = spec.groups, macro = spec.macro, tokens = spec.tokens, depth = 0, optional = false }, e + 1, s
+    end
+    pos = e + 1
   end
-  return false
 end
 
 ---Strip line comments. Respects `\%` as a literal percent.
@@ -91,7 +98,7 @@ local function strip_comment(line)
 end
 
 ---Walk lines and extract complete definitions. Multi-line definitions are
----tracked by brace depth.
+---tracked by mandatory argument count as well as brace depth.
 ---@param lines string[]
 ---@return string
 function M.extract_definitions(lines)
@@ -103,43 +110,73 @@ function M.extract_definitions(lines)
     -- Stop at \begin{document}; everything after is body, not preamble.
     if line:find("\\begin{document}", 1, true) then break end
 
-    if is_def_line(line) then
+    local state, pos = next_definition(line)
+    if state then
       local block = { raw }
-      local depth, started = 0, false
-      local function update(s)
-        local k = 1
-        while k <= #s do
+      local function update(s, k)
+        k = k or 1
+        while state do
+          if state.groups == 0 and (not state.tokens or state.tokens == 0) then
+            state, k = next_definition(s, k)
+            if not state then return end
+          end
+          if k > #s then return end
           local c = s:sub(k, k)
-          if c == "\\" and k < #s then k = k + 2
+          -- Consume both \let tokens before looking for another declaration.
+          -- Its source may itself be named \def or \newcommand.
+          if state.tokens then
+            if c:match("%s") then k = k + 1
+            elseif c == "=" and state.tokens == 1 and not state.equals then
+              state.equals = true
+              k = k + 1
+            else
+              local _, control_end = s:find("^\\[%a@]+", k)
+              k = c == "\\" and ((control_end or (k + 1)) + 1) or (k + 1)
+              state.tokens = state.tokens - 1
+            end
+            goto continue_char
+          end
+          if state.macro and not c:match("[%s*]") then
+            state.macro = false
+            if c == "\\" then
+              local _, control_end = s:find("^\\[%a@]+", k)
+              k = (control_end or (k + 1)) + 1
+              state.groups = state.groups - 1
+              goto continue_char
+            end
+          end
+          if c == "\\" then k = k + 2
           else
-            if c == "{" then depth = depth + 1; started = true
-            elseif c == "}" then depth = depth - 1 end
+            if c == "{" then state.depth = state.depth + 1
+            elseif c == "}" then
+              state.depth = math.max(0, state.depth - 1)
+              if state.depth == 0 and not state.optional then state.groups = state.groups - 1 end
+            elseif state.depth == 0 then
+              if c == "[" then state.optional = true
+              elseif c == "]" then state.optional = false end
+            end
             k = k + 1
           end
+          ::continue_char::
         end
       end
-      update(line)
-      -- Single-line forms: \def\foo{...}, \let\a\b, \edef\foo{...}.
-      -- These either have one brace pair on the same line (caught by the
-      -- depth check below) or no braces at all (\let). For \let we bail
-      -- immediately after the first line; the multi-line continuation is
-      -- only for the brace-balanced forms.
-      local is_brace_free_form = line:find("\\let%s*\\") and not line:find("{")
-      if is_brace_free_form then
-        out[#out + 1] = block[1]
-        i = i + 1
-        goto continue_outer
-      end
-      while (not started or depth > 0) and i < n do
+      update(line, pos)
+      while state and i < n do
+        local more_line = strip_comment(lines[i + 1])
+        if more_line:find("\\begin{document}", 1, true) then break end
+        -- An unfinished declaration while typing must not consume the next
+        -- independent definition when no argument is currently open.
+        local _, _, definition_start = next_definition(more_line)
+        if not state.tokens and state.depth == 0 and not state.optional and definition_start
+            and more_line:sub(1, definition_start - 1):match("^%s*$") then break end
         i = i + 1
         local more = lines[i]
         block[#block + 1] = more
-        update(strip_comment(more))
+        update(more_line)
       end
       out[#out + 1] = table.concat(block, "\n")
     end
     i = i + 1
-    ::continue_outer::
   end
   return table.concat(out, "\n")
 end
@@ -240,20 +277,38 @@ local function candidate_file_names(name)
   return { name .. ".sty", name .. ".tex" }
 end
 
+local function watch_path(watched, path)
+  if not watched.seen[path] then
+    watched.seen[path] = true
+    watched.paths[#watched.paths + 1] = path
+  end
+end
+
 ---@param start_dir string
+---@param source_dir string
 ---@param name string
 ---@param depth_cap integer
 ---@return string?
-local function find_local_tex_file(start_dir, name, depth_cap)
-  local dir, depth = start_dir, 0
-  while dir and dir ~= "" and dir ~= "/" and depth < depth_cap do
-    for _, fname in ipairs(candidate_file_names(name)) do
-      local cand = dir .. "/" .. fname
-      if uv.fs_stat(cand) then return cand end
+local function find_local_tex_file(start_dir, source_dir, name, depth_cap, watched)
+  local dirs, checked = { start_dir, source_dir }, {}
+  for _ = 1, depth_cap do
+    local parents = {}
+    for _, dir in ipairs(dirs) do
+      if dir and dir ~= "" and not checked[dir] then
+        checked[dir] = true
+        for _, fname in ipairs(candidate_file_names(name)) do
+          local cand = join_path(dir, fname)
+          -- Cache missing candidates as well: a newly created file or a
+          -- nearer override must invalidate a cached preamble.
+          watch_path(watched, cand)
+          local buf = buffer_for_path(cand)
+          if (buf and vim.api.nvim_buf_is_loaded(buf)) or uv.fs_stat(cand) then return cand end
+        end
+        local parent = vim.fs.dirname(dir)
+        if parent and parent ~= dir then parents[#parents + 1] = parent end
+      end
     end
-    local parent = vim.fs.dirname(dir)
-    if parent == dir then break end
-    dir, depth = parent, depth + 1
+    dirs = parents
   end
   return nil
 end
@@ -291,13 +346,6 @@ local function tex_arg_candidates(base_dirs, name)
     end
   end
   return out
-end
-
-local function watch_path(watched, path)
-  if not watched.seen[path] then
-    watched.seen[path] = true
-    watched.paths[#watched.paths + 1] = path
-  end
 end
 
 local function file_reaches_child(path, child_path, root_dir, seen, watched)
@@ -376,39 +424,42 @@ local function scan_referenced_files(start_path, source_lines)
   if not start_path then return "", {} end
   local start_dir = vim.fs.dirname(start_path)
   local queue = {}
-  for _, line in ipairs(source_lines) do
-    line = strip_comment(line)
-    if line:find("\\begin{document}", 1, true) then break end
-    vim.list_extend(queue, package_names_from_line(line))
-    vim.list_extend(queue, input_names_from_line(line))
+  local function enqueue(lines, source_dir)
+    for _, line in ipairs(lines) do
+      line = strip_comment(line)
+      if line:find("\\begin{document}", 1, true) then break end
+      local names = package_names_from_line(line)
+      vim.list_extend(names, input_names_from_line(line))
+      for _, name in ipairs(names) do queue[#queue + 1] = { name = name, dir = source_dir } end
+    end
   end
+  enqueue(source_lines, start_dir)
   if #queue == 0 then return "", {} end
 
   local seen_name, seen_file, found, file_lines = {}, {}, {}, {}
+  seen_file[start_path] = true
+  local watched = { paths = {}, seen = {} }
   local depth_cap = config.options.extract.sty_search_depth
   local qi = 1
   while qi <= #queue do
-    local name = queue[qi]
+    local source = queue[qi]
     qi = qi + 1
-    if not seen_name[name] then
-      seen_name[name] = true
-      local path = find_local_tex_file(start_dir, name, depth_cap)
+    local key = source.dir .. "\n" .. source.name
+    if not seen_name[key] then
+      seen_name[key] = true
+      local path = find_local_tex_file(start_dir, source.dir, source.name, depth_cap, watched)
       if path and not seen_file[path] then
         seen_file[path] = true
         found[#found + 1] = path
         local lines = lines_for_path(path)
         if lines then
           file_lines[path] = lines
-          for _, line in ipairs(lines) do
-            line = strip_comment(line)
-            vim.list_extend(queue, package_names_from_line(line))
-            vim.list_extend(queue, input_names_from_line(line))
-          end
+          enqueue(lines, vim.fs.dirname(path))
         end
       end
     end
   end
-  if #found == 0 then return "", {} end
+  if #found == 0 then return "", watched.paths end
 
   local parts = {}
   for _, sty in ipairs(found) do
@@ -421,7 +472,7 @@ local function scan_referenced_files(start_path, source_lines)
       end
     end
   end
-  return table.concat(parts, "\n"), found
+  return table.concat(parts, "\n"), watched.paths
 end
 
 ---Find local .sty files reachable from this buffer's directory and extract
@@ -440,15 +491,9 @@ end
 ---@param preamble string
 ---@return string
 local function normalize_for_mathjax(preamble)
-  -- MathJax supports \newcommand well, but common LaTeX declaration helpers
-  -- such as \DeclareMathOperator are not themselves macro definitions in
-  -- MathJax's TeX input. Convert the simple forms we can recognize.
-  preamble = preamble:gsub(
-    "\\DeclareMathOperator%s*%*?%s*{%s*(\\[%a@]+)%s*}%s*{([^{}\n]*)}",
-    function(cmd, body)
-      return "\\newcommand{" .. cmd .. "}{\\operatorname{" .. body .. "}}"
-    end
-  )
+  -- Keep native \DeclareMathOperator declarations: MathJax supports both
+  -- forms, and rewriting the starred form loses its display-style limits.
+  -- Convert only the unsupported delimiter helpers we can recognize.
   preamble = preamble:gsub(
     "\\DeclarePairedDelimiter%s*{%s*(\\[%a@]+)%s*}%s*{([^{}\n]*)}%s*{([^{}\n]*)}",
     function(cmd, left, right)

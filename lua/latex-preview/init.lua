@@ -484,13 +484,13 @@ function M.hover()
   return require("latex-preview.hover").open()
 end
 
----Toggle the hover popup: open if not visible (and the cursor is in a
----math expression), close if visible. Returns true if the popup is
----visible *after* the toggle.
+---Toggle the hover popup: open if inactive (and the cursor is in a
+---math expression), otherwise close or cancel its pending render.
+---Returns true if a preview is visible or requested after the toggle.
 ---@return boolean
 function M.toggle()
   local hover = require("latex-preview.hover")
-  if hover.is_open() then
+  if hover.is_active() then
     hover.close()
     return false
   end

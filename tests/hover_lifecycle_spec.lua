@@ -26,6 +26,8 @@ package.loaded["latex-preview.targets"] = {
 }
 package.loaded["latex-preview.render"] = {
   render = function(req, cb) requests[#requests + 1] = { req = req, cb = cb } end,
+  retain = function() end,
+  release = function() end,
 }
 
 local placements = 0
@@ -221,6 +223,22 @@ config.options.render.density = 450
 requests[#requests].cb(nil, "/tmp/outdated-mixed-density.png")
 eq(before_placements, placements, "mixed results must reject settings changed while rendering")
 hover.close()
+
+-- The toggle must cancel an initial render, before there is a visible popup.
+mode, display = "equation", false
+local lp = require("latex-preview")
+assert(lp.toggle(), "first toggle should request a preview")
+local toggled = requests[#requests]
+eq(false, lp.toggle(), "second toggle should cancel the pending preview")
+toggled.cb(nil, "/tmp/cancelled-toggle.png")
+eq(false, hover.is_open(), "a toggled-off render must not show a late popup")
+
+dofile("plugin/latex-preview.lua")
+vim.cmd("LatexPreview")
+toggled = requests[#requests]
+vim.cmd("LatexPreview toggle")
+toggled.cb(nil, "/tmp/cancelled-command-toggle.png")
+eq(false, hover.is_open(), "the command toggle must also cancel pending renders")
 
 vim.schedule, vim.uv = real_schedule, real_uv
 print("hover lifecycle regressions passed")

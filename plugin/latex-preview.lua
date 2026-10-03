@@ -66,18 +66,20 @@ local function set_density_command(kind, value)
   end
   if value == "reset" or value == "default" or value == "clear" then
     vim.b[key] = nil
+    local hover = require("latex-preview.hover")
+    if hover.is_active() then hover.open() end
     vim.notify("latex-preview: buffer " .. (kind == "display" and "display " or "") .. "density reset")
     return
   end
   local density = tonumber(value)
-  if not density or density <= 0 then
-    vim.notify("[latex-preview] density must be a positive number", vim.log.levels.ERROR)
+  if not density or density ~= density or density == math.huge or density < 0.5 then
+    vim.notify("[latex-preview] density must round to a finite positive integer", vim.log.levels.ERROR)
     return
   end
   local result = math.floor(density + 0.5)
   vim.b[key] = result
   local hover = require("latex-preview.hover")
-  if hover.is_open() then hover.open() end
+  if hover.is_active() then hover.open() end
   vim.notify("latex-preview: buffer " .. (kind == "display" and "display " or "")
     .. "density set to " .. tostring(result))
 end
@@ -89,7 +91,7 @@ local subcommands = {
   close = function() require("latex-preview").close() end,
   toggle = function()
     local lp = require("latex-preview")
-    if lp.is_open() then lp.close() else
+    if require("latex-preview.hover").is_active() then lp.close() else
       if not lp.hover() then no_math() end
     end
   end,

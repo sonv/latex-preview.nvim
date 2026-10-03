@@ -286,6 +286,41 @@ assert_true(count_render_groups(temp_dir) <= 1, "temp cache kept more than one r
 assert_grouped_pairs(temp_dir)
 assert_info_maps_to_image(temp_dir)
 
+-- Cache limits must not delete a PNG while a hover placement still uses it.
+local active_path
+local win_factory = { resolve = function(_, _, opts) return opts end }
+setmetatable(win_factory, { __call = function(_, opts)
+  return {
+    opts = opts,
+    open_buf = function(self) self.buf = vim.api.nvim_create_buf(false, true) end,
+    show = function() end,
+    close = function(self) vim.api.nvim_buf_delete(self.buf, { force = true }) end,
+  }
+end })
+package.loaded["snacks"] = {
+  win = win_factory,
+  config = { merge = function(...) return vim.tbl_deep_extend("force", ...) end },
+  image = {
+    config = { doc = {} },
+    terminal = { env = function() return { placeholders = true } end },
+    placement = { new = function(_, path)
+      active_path = path
+      return { img = { src = path }, close = function() end }
+    end },
+  },
+}
+vim.api.nvim_buf_set_lines(buf, 0, -1, false, { "$active$" })
+config.options.snacks.max_cache_files = 0
+config.options.snacks.max_cache_bytes = 1
+local hover = require("latex-preview.hover")
+assert_true(hover.open(), "hover must start its render")
+assert_true(vim.wait(2000, function() return active_path ~= nil end, 10), "hover did not place its PNG")
+vim.wait(500, function() return false end, 10)
+assert_true(uv.fs_stat(active_path), "cache trimming deleted the active hover PNG")
+hover.close()
+assert_true(vim.wait(2000, function() return not uv.fs_stat(active_path) end, 10),
+  "closing the hover must make its PNG eligible for trimming")
+
 local snacks_cache = root .. "/snacks-cache"
 vim.fn.mkdir(snacks_cache, "p")
 for i = 1, 12 do

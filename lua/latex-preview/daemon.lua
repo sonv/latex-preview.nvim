@@ -25,6 +25,7 @@ local M = {}
 
 local uv = vim.uv or vim.loop
 local config = require("latex-preview.config")
+local shutting_down = false
 
 ---@class LatexPreview.daemon.State
 ---@field handle? uv.uv_process_t
@@ -273,6 +274,10 @@ end
 ---@param req { preamble: string, equation: string, display: boolean, color: string }
 ---@param cb fun(err: string?, svg: string?)
 function M.render(req, cb)
+  if shutting_down then
+    vim.schedule(function() cb("daemon is shutting down", nil) end)
+    return
+  end
   if not state.handle then
     if not spawn() then
       vim.schedule(function() cb("daemon spawn failed", nil) end)
@@ -312,6 +317,8 @@ end
 
 ---Shut down the daemon. Idempotent.
 function M.shutdown()
+  local was_shutting_down = shutting_down
+  shutting_down = true
   if state.stdin and not state.stdin:is_closing() then
     pcall(function() state.stdin:write(vim.json.encode({ quit = true }) .. "\n") end)
   end
@@ -319,6 +326,7 @@ function M.shutdown()
   -- the quit message can outlive Neovim with no handle left to terminate it.
   if state.handle then pcall(function() state.handle:kill("sigterm") end) end
   reset("vim shutdown")
+  shutting_down = was_shutting_down
 end
 
 function M.is_ready()

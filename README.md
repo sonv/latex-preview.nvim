@@ -118,7 +118,8 @@ previews are enabled by default.
 - **Citations:** commands containing `cite`, such as `\cite`, `\citet`,
   `\citep`, `\parencite`, and `\textcite`, show the matching BibTeX entry.
   Local `.bib` files must be listed with `\bibliography` or
-  `\addbibresource` in the current buffer. For multiple keys, the key
+  `\addbibresource` in the current buffer. Unsaved edits in loaded
+  bibliography buffers are included. For multiple keys, the key
   under the cursor is selected when possible, otherwise the first is used.
 
 Target lookup is local and static. It does not search other chapters for
@@ -228,6 +229,8 @@ the option name, it removes images as well as metadata. The settings
 `snacks.max_cache_files = 100`, `snacks.max_cache_bytes = 50 * 1024 * 1024`,
 and `snacks.cache_grace_ms = 5000` also bound Snacks cache groups and
 reusable session renders. They do not limit the persistent project cache.
+Session images used by an open preview are retained until it closes, even
+when this temporarily exceeds the limit.
 Set either limit to `0` to disable that limit.
 
 ### Lua API

@@ -41,22 +41,28 @@ local TS_QUERIES = {
 }
 local ts_queries = {}
 
+local math_delimiters = {
+  { "$$", "$$", true },
+  { "\\[", "\\]", true },
+  { "\\(", "\\)", false },
+  { "$", "$", false },
+}
+
 local function strip_math_delimiters(text)
   local stripped = vim.trim(text)
-  stripped = stripped
-    :gsub("^%$%$", ""):gsub("%$%$$", "")
-    :gsub("^%$", ""):gsub("%$$", "")
-    :gsub("^\\%[", ""):gsub("\\%]$", "")
-    :gsub("^\\%(", ""):gsub("\\%)$", "")
-
-  if stripped:match("^\\begin%s*{[^}]+}") then
-    -- MathJax needs the environment wrapper for AMS multiline environments
-    -- such as align*, gather, multline, flalign, and eqnarray. Stripping it
-    -- leaves bare alignment markers (`&`, `\\`) that fail with "Misplaced &".
-    return stripped
+  for _, pair in ipairs(math_delimiters) do
+    local opening, closing = pair[1], pair[2]
+    if #stripped >= #opening + #closing
+      and stripped:sub(1, #opening) == opening
+      and stripped:sub(-#closing) == closing
+    then
+      -- Remove exactly one matching pair. Chained substitutions can remove
+      -- an escaped dollar or a nested delimiter from the actual math body.
+      return vim.trim(stripped:sub(#opening + 1, -#closing - 1))
+    end
   end
-
-  return vim.trim(stripped)
+  -- MathJax needs environment wrappers to interpret alignment syntax.
+  return stripped
 end
 
 ---@param buf integer
@@ -114,11 +120,106 @@ end
 
 -- Regex fallback ------------------------------------------------------------
 
+local function find_unescaped(source, delimiter, start)
+  while true do
+    local pos = source:find(delimiter, start, true)
+    if not pos or not util.is_escaped(source, pos) then return pos end
+    start = pos + 1
+  end
+end
+
+-- Mask ignored text with spaces so byte offsets still refer to the buffer.
+-- Keep the original source separately when extracting the math itself.
+local function searchable_source(lines, ft)
+  local is_tex = ft == "tex" or ft == "latex" or ft == "plaintex"
+  local is_markdown = ft == "markdown" or ft == "rmd" or ft == "quarto"
+  if not is_tex and not is_markdown then return table.concat(lines, "\n") end
+
+  local searchable = {}
+  local fence_char, fence_length
+  for i, line in ipairs(lines) do
+    if is_tex then
+      local comment = util.tex_comment_start(line)
+      searchable[i] = comment and (line:sub(1, comment - 1) .. string.rep(" ", #line - comment + 1)) or line
+    else
+      local fence, rest = line:match("^ ? ? ?([`~]+)(.*)$")
+      local valid_fence = fence and #fence >= 3 and fence == string.rep(fence:sub(1, 1), #fence)
+      if fence_char then
+        searchable[i] = string.rep(" ", #line)
+        if valid_fence and fence:sub(1, 1) == fence_char and #fence >= fence_length and rest:match("^%s*$") then
+          fence_char, fence_length = nil, nil
+        end
+      elseif valid_fence and (fence:sub(1, 1) ~= "`" or not rest:find("`", 1, true)) then
+        fence_char, fence_length = fence:sub(1, 1), #fence
+        searchable[i] = string.rep(" ", #line)
+      else
+        searchable[i] = line
+      end
+    end
+  end
+
+  local source = table.concat(searchable, "\n")
+  if not is_markdown or not source:find("`", 1, true) then return source end
+
+  -- Code spans close with a backtick run of exactly the opening length.
+  -- Index the next matching run once to avoid repeated scans for unmatched
+  -- backticks in long Markdown buffers. Runs inside a span are skipped.
+  local runs, next_length = {}, {}
+  local pos, paragraph = 1, 1
+  while true do
+    local first, last = source:find("`+", pos)
+    if not first then break end
+    -- Blank lines end a paragraph. Masked fence lines also form a barrier,
+    -- so a stray backtick cannot start a span across a fenced code block.
+    if source:sub(pos, first - 1):find("\n[ \t]*\n") then paragraph = paragraph + 1 end
+    runs[#runs + 1] = { first, last, nil, paragraph }
+    pos = last + 1
+  end
+  local next_paragraph
+  for i = #runs, 1, -1 do
+    if runs[i][4] ~= next_paragraph then next_length = {} end
+    local length = runs[i][2] - runs[i][1] + 1
+    runs[i][3] = next_length[length]
+    next_length[length] = i
+    next_paragraph = runs[i][4]
+  end
+  local chunks, copied, i = {}, 1, 1
+  while i <= #runs do
+    local run = runs[i]
+    if run[3] and not util.is_escaped(source, run[1]) then
+      local last = runs[run[3]][2]
+      chunks[#chunks + 1] = source:sub(copied, run[1] - 1)
+      chunks[#chunks + 1] = source:sub(run[1], last):gsub("[^\n]", " ")
+      copied, i = last + 1, run[3] + 1
+    else
+      i = i + 1
+    end
+  end
+  chunks[#chunks + 1] = source:sub(copied)
+  return table.concat(chunks)
+end
+
+local fallback_pairs = {}
+for i = 1, 3 do
+  local pair = math_delimiters[i]
+  fallback_pairs[#fallback_pairs + 1] = { opening = pair[1], closing = pair[2], display = pair[3] }
+end
+for _, env in ipairs({ "equation", "align", "alignat", "flalign", "gather", "multline", "eqnarray" }) do
+  for _, suffix in ipairs({ "", "*" }) do
+    local name = env .. suffix
+    fallback_pairs[#fallback_pairs + 1] = {
+      opening = "\\begin{" .. name .. "}", closing = "\\end{" .. name .. "}", display = true, environment = true,
+    }
+  end
+end
+
 ---@param buf integer
 ---@return LatexPreview.Equation[]
+---@return fun(eq: LatexPreview.Equation): boolean visible True when a range contains no masked code/comment text.
 local function regex_extract(buf)
   local lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
-  local source = table.concat(lines, "\n")
+  local original_source = table.concat(lines, "\n")
+  local source = searchable_source(lines, vim.bo[buf].filetype)
   local results = {}
 
   -- For each match, we need to convert byte offsets back to (row, col).
@@ -164,43 +265,20 @@ local function regex_extract(buf)
     end
   end
 
-  -- Each entry: {pattern, display, kind}
-  -- kind:
-  --   "delim_match"  the capture is the math text directly
-  --   "env"          keep the full environment wrapper for MathJax
-  local patterns = {
-    -- $$...$$ display, line-spanning. The capture is the body.
-    { prefix = "$$", pat = "%$%$(.-)%$%$",          display = true,  kind = "delim_match" },
-    -- \[...\] display
-    { prefix = "\\[", pat = "\\%[(.-)\\%]",          display = true,  kind = "delim_match" },
-    -- \(...\) inline
-    { prefix = "\\(", pat = "\\%((.-)\\%)",          display = false, kind = "delim_match" },
-    -- Math environments with optional star. Keep the wrapper so MathJax can
-    -- interpret environment-specific alignment syntax.
-    { prefix = "\\begin{equation", pat = "\\begin{equation%*?}(.-)\\end{equation%*?}", display = true, kind = "env" },
-    { prefix = "\\begin{align", pat = "\\begin{align%*?}(.-)\\end{align%*?}",       display = true, kind = "env" },
-    { prefix = "\\begin{alignat", pat = "\\begin{alignat%*?}%s*%b{}(.-)\\end{alignat%*?}", display = true, kind = "env" },
-    { prefix = "\\begin{flalign", pat = "\\begin{flalign%*?}(.-)\\end{flalign%*?}",   display = true, kind = "env" },
-    { prefix = "\\begin{gather", pat = "\\begin{gather%*?}(.-)\\end{gather%*?}",     display = true, kind = "env" },
-    { prefix = "\\begin{multline", pat = "\\begin{multline%*?}(.-)\\end{multline%*?}", display = true, kind = "env" },
-    { prefix = "\\begin{eqnarray", pat = "\\begin{eqnarray%*?}(.-)\\end{eqnarray%*?}", display = true, kind = "env" },
-  }
-
-  for _, p in ipairs(patterns) do
+  for _, p in ipairs(fallback_pairs) do
     local pos2 = 1
     while pos2 <= #source do
-      -- Most documents use only a few delimiter types. A literal search
-      -- avoids a full Lua-pattern scan for every absent environment.
-      pos2 = source:find(p.prefix, pos2, true)
-      if not pos2 then break end
-      local s, e, body = source:find(p.pat, pos2)
+      local s = find_unescaped(source, p.opening, pos2)
       if not s then break end
+      local closing = find_unescaped(source, p.closing, s + #p.opening)
+      if not closing then break end
+      local e = closing + #p.closing - 1
       if not_consumed(s, e) then
         local text
-        if p.kind == "env" then
-          text = vim.trim(source:sub(s, e))
+        if p.environment then
+          text = vim.trim(original_source:sub(s, e))
         else
-          text = vim.trim(body or "")
+          text = vim.trim(original_source:sub(s + #p.opening, closing - 1))
         end
         if text ~= "" then
           local sr, sc = byte_to_rc(s - 1)
@@ -244,7 +322,7 @@ local function regex_extract(buf)
         j = j + 1
       end
       if closed and not_consumed(i, closed) then
-        local body = source:sub(i + 1, closed - 1)
+        local body = original_source:sub(i + 1, closed - 1)
         body = vim.trim(body)
         if body ~= "" then
           local sr, sc = byte_to_rc(i - 1)
@@ -273,7 +351,12 @@ local function regex_extract(buf)
     if a.start_row ~= b.start_row then return a.start_row < b.start_row end
     return a.start_col < b.start_col
   end)
-  return results
+  local function visible(eq)
+    local first = row_starts[eq.start_row + 1] + eq.start_col + 1
+    local last = (row_starts[eq.end_row + 1] or #source) + eq.end_col
+    return source:sub(first, last) == original_source:sub(first, last)
+  end
+  return results, visible
 end
 
 ---@param equations LatexPreview.Equation[]
@@ -341,7 +424,15 @@ function M.find_equations(buf)
     if r then result = r end
   elseif ft == "markdown" or ft == "rmd" or ft == "quarto" then
     local r = ts_extract(buf, "markdown_inline")
-    if r then result = merge_non_overlapping(r, regex_extract(buf)) end
+    local fallback, visible = regex_extract(buf)
+    if r then
+      -- The inline parser sees the entire buffer without the Markdown block
+      -- grammar, so it can capture math in fences (notably tilde fences).
+      r = vim.tbl_filter(visible, r)
+      result = merge_non_overlapping(r, fallback)
+    else
+      result = fallback
+    end
   end
   result = result or regex_extract(buf)
   cache[buf] = { tick = tick, ft = ft, value = result }
